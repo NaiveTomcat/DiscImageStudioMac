@@ -13,3 +13,4 @@ out/
 *.cue
 *.dmg
 *.log
+dist/

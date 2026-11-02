@@ -98,15 +98,27 @@ Sources/
   DiscImageStudioApp/  @main 薄壳
 Tests/                 每个 target 对应一个测试 target
 docs/                  架构与验证说明
-scripts/               构建/测试包装脚本
+scripts/               构建 / 测试 / 验收 / 打包签名公证脚本
+dist/                  打包产物（.app / .dmg，已 gitignore）
 ```
 
 分层与依赖方向见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
+## 打包分发
+
+```bash
+scripts/package.sh          # release 构建 → .app → 签名 → DMG → 公证 → 装订 → Gatekeeper 验收
+```
+
+产物在 `dist/`：`DiscImageStudio.app` 与 `DiscImageStudio-<版本>.dmg`（Developer ID 签名 +
+hardened runtime + 公证票据）。首次公证需要一次凭据配置，见
+[docs/RELEASING.md](docs/RELEASING.md)。
 
 ## 文档
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：target 分层、数据流、为什么 UI 不依赖 CLI、为什么 CD 依赖 DVD、刻录层设计
 - [docs/VALIDATION.md](docs/VALIDATION.md)：数学不变量清单、`hdiutil` 挂载验证、**明确写出的不可验证边界**
+- [docs/RELEASING.md](docs/RELEASING.md)：打 DMG、Developer ID 签名、公证凭据配置、Gatekeeper 验收
 - [HANDOFF.md](HANDOFF.md)：项目唯一的上下文来源（编码规格、盘片预设、架构决策）
 
 ## 许可证与原出处
