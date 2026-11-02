@@ -104,6 +104,19 @@ dist/                  打包产物（.app / .dmg，已 gitignore）
 
 分层与依赖方向见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
+## 性能
+
+整盘生成（release 构建、Apple M5、默认并行）：
+
+| 介质 | 整盘规模 | 耗时 |
+|---|---|---|
+| DVD-5 | 2,295,104 扇区 / 4.4 GB | 34 s |
+| CD 80min | 359,849 扇区 / 845 MB | 9.7 s |
+| BD-R SL | 12,219,392 扇区 / 25 GB | 66 s（纯计算） |
+
+并行化不改变任何一个输出字节：`scripts/reference.sh --check` 会重新生成四种参考产物，
+并断言「串行」与「8 线程并行」逐字节相同。详见 [docs/VALIDATION.md](docs/VALIDATION.md) §6。
+
 ## 打包分发
 
 ```bash

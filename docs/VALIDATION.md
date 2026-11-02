@@ -173,3 +173,51 @@ afinfo artifacts/cover.wav                    # 期望：44.1 kHz / 16 bit / 2 c
 - 刻录层：`DiscImageBurningTests` 当前 60 个用例（以 `swift test` 实际输出为准），覆盖命令构造、输出解析、错误分类、预检、取消、Mock 行为；全部使用假执行器，**没有任何测试调用 `drutil` / `hdiutil`**。
 - CI：`.github/workflows/ci.yml` 在 `macos-latest` 上跑 `swift build` + `swift test`；CI 机器没有刻录机，因此 CI 通过 **不代表** 烧录可用。
 - 本机实测记录：`drutil list` 在无光驱时只打印表头（已作为解析回归样本）；`drutil status` 无光驱时输出为空且退出码 0；`drutil -drive 1 status` 退出码 1、stderr 为 `Could not find a valid device.`。
+
+---
+
+## 6. 可复现性与性能（2026-11-02 补）
+
+### 6.1 逐字节可复现
+
+DVD 的 ISO9660 PVD/SVD 与目录记录带 wall-clock 时间戳，1024 扇区输出里有 32 字节会随生成时刻漂移
+（payload 完全一致）。引擎支持 `SOURCE_DATE_EPOCH`（Unix 秒，可带小数）钉住这些时间戳：
+
+```bash
+SOURCE_DATE_EPOCH=1700000000 discimage-cli generate --family dvd ...
+```
+
+`scripts/reference.sh` 用固定 epoch 生成四种参考产物，并断言「串行（`DISCI_MAX_WORKERS=1`）」
+与「8 线程并行」的输出**逐字节相同**：
+
+```bash
+scripts/reference.sh          # 重建参考产物
+scripts/reference.sh --check  # 校验当前构建是否仍与参考一致
+```
+
+### 6.2 并行与写入顺序
+
+`DiscImageCore.ParallelPipeline` 把块组切成 `workers` 个连续区间并行计算，再按 0,1,2… 顺序交给
+单线程消费者写 `SequentialSink`。因此并行化**不改变任何一个字节**，也不改变文件长度；
+两条路径输出一致是每次优化都必须通过的验收项（见 `scripts/reference.sh --check`）。
+
+### 6.3 性能基线（release 构建，本机 Apple M5，实测）
+
+| 介质 | 整盘规模 | 优化前 | 优化后 | 提升 |
+|---|---|---|---|---|
+| DVD-5 | 2,295,104 扇区 / 4.4 GB | 197 s | **33.9 s** | 5.8× |
+| CD 80min | 359,849 扇区 / 845 MB | 94 s | **9.7 s** | 9.7× |
+| BD-R SL | 12,219,392 扇区 / 25 GB | 约 2.3 h（外推） | **66 s**（写 /dev/null 纯计算） | ≈125× |
+
+优化手段（全部保持输出逐字节不变）：
+
+1. **并行**：`ParallelPipeline` 按块/簇/采样段并行，单线程按序写 sink。
+2. **蓝光位置表**：每簇用精确 x/y 表 + 线性插值替代每字节 `trackPoint`（Newton 迭代），
+   边界回退保证像素索引与精确路径一致；`trackPoint` 调用从 65,536/簇降到约 1,900/簇。
+3. **批量写**：蓝光每簇 64 KiB 一次写（整盘系统调用 1220 万 → 38 万）；CD 32 扇区一批。
+4. **缓存与内联**：DVD 缓冲池复用 32 KiB 块、RGBA 用 4 次 32-bit 加载取双线性样本、
+   影调判定 256 项 LUT；CD 预计算像素亮度表、交织环用裸缓冲。
+5. **可复现**：DVD 的时间戳由 `SOURCE_DATE_EPOCH` 钉住（见 6.1）。
+
+> 本机负载波动大（同时有 18 个登录会话），wall 时间随负载浮动 ±20%；`user` CPU 更稳定。
+> 并行时 user CPU 是各线程总和（含能效核），因此会比单核高，但 wall 才是体感。
