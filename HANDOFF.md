@@ -480,3 +480,68 @@ UI 验收额外项：离屏渲染主页 + 设计页 PNG 成功。
 - ❌ 不要为了"逐字节等价"去猜源项目输出（无法验证，只验证数学不变量）
 - ❌ 不要把各介质合并进一个 target（会让并行开发互相阻塞）
 - ❌ 不要在 `DiscImageCore` 里引入 SwiftUI / AppKit
+
+---
+
+## 11. 首版落地记录（2026-11-02）
+
+> 这一节是**移植完成后**补写的，记录实际结果、与 §4.3 的偏差、以及没有硬件时到底验证到了哪一步。
+> 上游规格（§2）与架构决策（§4）未改动。
+
+### 11.1 完成范围
+
+| 工作包 | 交付 | 测试 |
+|---|---|---|
+| Core（lead） | 几何/螺旋/影调/投影/RasterImage/SequentialSink/FileTree/预设/Pipeline 契约 | 56 用例 |
+| A DVD | 扰码 + ECC(PI/PO 增量重建) + EFMPlus(双流 DSV + SYNC 替换) + NRZI + 快速纹理映射 + `Iso9660Writer` | 47 用例 |
+| B CD | 几何采样 + 2/4 阶灰阶 + 112 帧延迟交织 + WAV/CUE（小端）+ RAW（大端）+ Mode 1 数据盘 | 61 用例 |
+| C 蓝光 | EDC + LDC/BIS + 17PP + 28 位 DC 控制 + RUB + 3T/6T + UDF 2.01 + sidecar | 36 用例 |
+| D GUI | 六页面（主页/设计/预览/导出/刻录/标定）+ `.discproj` v2 + ImageRenderer 离屏回归 | 80 用例 |
+| E 刻录 | `BurnService`/`DrutilBurner`/`MockBurnService` + 命令构造/解析纯函数 + 文档 + CI | 60 用例 |
+| CLI（lead） | `discimage-cli generate/presets/geometry/info`，三引擎已接线 | 端到端脚本 |
+
+合计约 1.57 万行 Swift 源码 + 0.66 万行测试。
+
+### 11.2 与 HANDOFF §4.3 的两处必要偏差（SwiftPM 硬约束，已在 `Package.swift` 与 `docs/ARCHITECTURE.md` 注明）
+
+1. **`DiscImageUI` 不依赖 `DiscImageCLI`**：SwiftPM 不允许 library target 依赖 executable target。UI 直接依赖三引擎 + 刻录封装，符合「UI 单向依赖引擎」。
+2. **`DiscImageCd` 依赖 `DiscImageDvd`**：CD 数据盘模式复用 A 的 `Iso9660Writer`（§6.B 的要求），只能靠 target 依赖表达。
+
+另：新增 `Tests/DiscImageBurningTests` target（E 需要）。
+
+### 11.3 验收证据（`scripts/verify.sh`，本机实测）
+
+```
+✓ 构建通过（swift build，0 error）
+✓ 测试全绿（340 个用例，0 failure；蓝光挂载用例默认跳过，设 BLURAY_MOUNT_TEST=1 可开）
+✓ DVD 纯绘图生成
+✓ DVD 数据盘生成 + hdiutil 挂载成功，内容含 readme.txt
+✓ 蓝光数据盘生成 + hdiutil 挂载成功，内容含 readme.txt
+✓ 蓝光 sidecar JSON
+✓ CD 生成 WAV + 旁写 CUE + RIFF 头正确
+```
+
+`discimage-cli generate` 的 256/640 扇区小几何约 0.3–1.1 s（debug）；GUI 用
+`.build/debug/DiscImageStudio` 可启动并常驻（无崩溃输出）。
+
+### 11.4 有意不做（与 §6/§10 一致）
+
+- DVD beam search / state-control 求解器（只做快速纹理映射）。
+- Windows 刻录层（IMAPI2/COM/MMC）——改用 `drutil` / `hdiutil`。
+- CD 的 CIRC 与 EFM（源项目本身就没有）。
+- 与源项目输出逐字节对拍（本机无 .NET，改用数学不变量 + 系统可挂载）。
+
+### 11.5 本机无法验证的部分（必须写进任何对外说明）
+
+1. **真实烧录**：本机没有刻录机、没有空白光盘；刻录链路只验证到「命令构造 + 输出解析 + 错误翻译 + 取消措辞」。
+2. **实盘光学极性**：DVD 的 0xA5/0x92 与 BD 的 3T/6T 都是编码统计约定，不是实测反射率；极性反转只在数据模型里表达。
+3. **图案在真盘上的对齐**：`drutil` 不保证 DAO 字节级控制（§3.4 风险 1），图案可能整体旋转/偏移。
+4. **性能**：debug 下整盘 DVD/CD 是小时级、分钟级（如 cd-74 整盘 debug ≈27 分钟）；release 快一个数量级，但未做并行生成优化。
+
+### 11.6 后续可做（优先级从高到低）
+
+1. 引擎发布版提速：SIMD 采样 + 多核按块并行（按序写 sink）。
+2. GUI 设计页 8192 px 合成放到后台队列（目前主线程同步，会卡几秒）。
+3. 预览页「成品读回」接引擎真实读回产物（目前显示源灰度 + 字节数粗估的文件区）。
+4. CD 旁写元数据（`cd-da-track-v1` / `cd-rom-mode1-v1`），供读回按实测几何还原。
+5. 拿到刻录机后：实盘标定 → 更新预设 → 用 `docs/VALIDATION.md` 的步骤回填真实证据。
