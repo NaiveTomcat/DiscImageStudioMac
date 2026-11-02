@@ -18,6 +18,7 @@ func printUsage() {
       generate   把图片（可选再加一个文件夹）编码成盘片镜像
       presets    列出内置盘片预设
       geometry   打印某个盘片几何的关键参数（总长、螺距、圈数）
+      calibration 标定闭环：生成标定图案/会话（pattern）、从曲线点反推参数（fit）
       info       打印构建信息
 
     generate 选项：
@@ -61,6 +62,8 @@ func main() -> Int32 {
             runPresets(arguments)
         case "geometry":
             try runGeometry(arguments)
+        case "calibration":
+            try runCalibration(arguments)
         case "info", "--version", "-v":
             printInfo()
         case "help", "--help", "-h":
