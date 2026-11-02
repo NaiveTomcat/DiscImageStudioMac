@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+.swiftpm/
+*.xcodeproj
+DerivedData/
+artifacts/
+*.iso
+*.bin
+*.wav
+*.raw
