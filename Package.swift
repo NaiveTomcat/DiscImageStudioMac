@@ -26,7 +26,7 @@ let package = Package(
     ],
     targets: [
         // 共享、与介质无关的模型。由 lead 独占。
-        .target(name: "DiscImageCore"),
+        .target(name: "DiscImageCore", resources: [.process("Resources")]),
 
         // 每种介质一个 target。
         .target(name: "DiscImageDvd", dependencies: ["DiscImageCore"]),
