@@ -1,0 +1,37 @@
+# DiscImageStudioMac CI
+#
+# 只做两件事：构建整个 SwiftPM 包、跑全部测试。
+# 刻意不做的事：
+#   - 不调用 drutil / hdiutil，也不烧盘：GitHub 的 macos-latest 没有刻录机，
+#     测试里的刻录层全部走假执行器（见 docs/VALIDATION.md §4）；
+#   - 不下载第三方 Swift 包：本仓库没有外部依赖。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: swift build + swift test (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: swift --version
+
+      # CI 上不需要 --disable-sandbox（那是受限沙箱环境的开关），
+      # 只用 --scratch-path 把构建产物固定在 .build。
+      - name: Build
+        run: swift build --scratch-path .build
+
+      - name: Test
+        run: swift test --scratch-path .build
