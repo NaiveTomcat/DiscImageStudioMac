@@ -131,7 +131,8 @@ hardened runtime + 公证票据）。首次公证需要一次凭据配置，见
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：target 分层、数据流、为什么 UI 不依赖 CLI、为什么 CD 依赖 DVD、刻录层设计
 - [docs/VALIDATION.md](docs/VALIDATION.md)：数学不变量清单、`hdiutil` 挂载验证、**明确写出的不可验证边界**
-- [docs/RELEASING.md](docs/RELEASING.md)：打 DMG、Developer ID 签名、公证凭据配置、Gatekeeper 验收
+- [docs/RELEASING.md](docs/RELEASING.md)：打 DMG、Developer ID 签名、公证凭据配置、Gatekeeper 验收、GitHub 发布
+- [CHANGELOG.md](CHANGELOG.md)：版本记录
 - [HANDOFF.md](HANDOFF.md)：项目唯一的上下文来源（编码规格、盘片预设、架构决策）
 
 ## 许可证与原出处

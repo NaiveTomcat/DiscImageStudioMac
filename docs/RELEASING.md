@@ -142,3 +142,30 @@ Sparkle、tuist 等工具常见的做法。bundle 的字段与 Xcode 生成的�
 - 公证需要联网（Apple 服务），且要求应用用 Developer ID 证书 + hardened runtime 签名。
 - 未公证的 DMG 在别的机器上会被 Gatekeeper 拦截（`--skip-notarize` 只适合本机自测）。
 - 当前产物是 arm64（Apple Silicon）单架构；要兼容 Intel 需在脚本里加 `--arch x86_64` 的通用二进制构建（`swift build --arch arm64 --arch x86_64`）。
+
+## 7. 发布到 GitHub（预发布）
+
+```bash
+# 1) 确认工作区干净、产物是最新构建
+git status --short
+scripts/package.sh                     # 重新签名 + 公证 + 装订
+
+# 2) 打 tag（与 Info.plist 里的 CFBundleShortVersionString 一致）
+git tag -a v0.1.0 -m "v0.1.0 首个预发布"
+git push origin v0.1.0
+
+# 3) 附上 DMG 与校验和，标记为 pre-release
+shasum -a 256 dist/DiscImageStudio-0.1.0.dmg > dist/SHA256SUMS
+gh release create v0.1.0 \
+    dist/DiscImageStudio-0.1.0.dmg dist/SHA256SUMS \
+    --prerelease \
+    --title "v0.1.0 — 首个预发布（等待实盘验证）" \
+    --notes-file CHANGELOG.md
+```
+
+说明：
+
+- **pre-release 的含义**：功能齐全但**没有任何真实烧录验证**，属于「等硬件到位再确认为正式版」的状态。
+  正式版应在实盘标定、极性复核之后再把 `--prerelease` 去掉。
+- DMG 用 Developer ID 签名并公证，用户下载后双击即可打开（无需右键绕过 Gatekeeper）。
+- `dist/` 不进 git；发布资产只挂在 GitHub Release 上。
