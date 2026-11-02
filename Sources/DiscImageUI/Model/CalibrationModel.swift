@@ -79,6 +79,24 @@ public final class CalibrationModel: ObservableObject {
             if fitDvdPitch != oldValue { invalidateFit(message: "拟合选项已修改，请重新反推参数。") }
         }
     }
+    /// 自动扩大搜索范围（±0.02 → ±0.1 → ±0.5 mm）。
+    @Published public var autoRange = true {
+        didSet {
+            if autoRange != oldValue { invalidateFit(message: "搜索范围设置已修改，请重新反推参数。") }
+        }
+    }
+    /// 关闭自动扩大时使用的手动搜索半径（±mm，0.005–1.0，步进 0.005）。
+    @Published public var manualSearchRangeMm = 0.02 {
+        didSet {
+            if manualSearchRangeMm != oldValue { invalidateFit(message: "搜索范围设置已修改，请重新反推参数。") }
+        }
+    }
+    /// 反推作业状态（后台执行；主线程只消费结果）。
+    @Published public private(set) var isFitting = false
+    /// `nil` 表示不确定进度（后台拟合没有可用的分段进度）。
+    @Published public private(set) var fitProgress: Double?
+    /// 最近一次反推（同步或后台）的耗时。
+    @Published public private(set) var lastFitDuration: TimeInterval?
     @Published public private(set) var tracePoints: [CalibrationPoint] = []
     @Published public private(set) var selectedTraceIndex: Int?
     @Published public private(set) var fitResult: CalibrationFitResult?
@@ -88,6 +106,14 @@ public final class CalibrationModel: ObservableObject {
 
     @Published public private(set) var statusMessage = "先导入一张实拍照片；也可以打开已有的标定记录继续。"
     @Published public var errorMessage: String?
+
+    /// 手动搜索范围的合法区间与步进。
+    public static let manualSearchRangeLimits: ClosedRange<Double> = 0.005...1.0
+    public static let manualSearchRangeStep = 0.005
+
+    private var inputRevision = 0
+    private var fitCancellation: CancellationFlag?
+    private var fitTask: Task<Void, Never>?
 
     public init() {}
 
@@ -105,6 +131,36 @@ public final class CalibrationModel: ObservableObject {
     public var canConfirmRectification: Bool { rectification != nil && !rectificationConfirmed }
 
     public var canFit: Bool { rectificationConfirmed && !tracePoints.isEmpty }
+
+    /// 「反推参数」按钮：输入合法、且没有正在跑的作业。
+    public var canStartFit: Bool {
+        canFit && !isFitting && searchRangeValidationMessage == nil
+    }
+
+    /// 手动搜索范围的中文校验错误；自动模式或合法时返回 nil。
+    public var searchRangeValidationMessage: String? {
+        guard !autoRange else { return nil }
+        let value = manualSearchRangeMm
+        guard value.isFinite else { return "手动搜索范围必须是有限数值。" }
+        guard Self.manualSearchRangeLimits.contains(value) else {
+            return String(format: "手动搜索范围必须在 0.005–1.0 mm 之间（当前 %.3f mm）。", value)
+        }
+        let steps = value / Self.manualSearchRangeStep
+        guard abs(steps - steps.rounded()) < 1e-6 else {
+            return "手动搜索范围必须按 0.005 mm 步进。"
+        }
+        return nil
+    }
+
+    /// 真正传给 Core 的拟合选项（UI/测试共用）。
+    public var effectiveFitOptions: CalibrationFitOptions {
+        var options = CalibrationFitOptions.default
+        options.autoRange = autoRange
+        options.searchRangeMm = autoRange ? 0.02 : manualSearchRangeMm
+        options.fitDvdPitch = fitDvdPitch && (generation?.geometry.family == .dvd)
+        options.adaptiveRobustScale = true
+        return options
+    }
 
     public var canSaveSession: Bool { generation != nil }
 
@@ -170,17 +226,24 @@ public final class CalibrationModel: ObservableObject {
         lines.append(accepted
             ? String(format: "候选 · 平均偏差 %.3f mm · 最大 %.3f mm", candidate.rmsErrorMm, candidate.maxErrorMm)
             : String(format: "未通过 · 平均偏差 %.3f mm · 最大 %.3f mm，不能应用", candidate.rmsErrorMm, candidate.maxErrorMm))
-        if let range = fitResult.searchRangeMm, range.1 > 0.0201 {
-            lines.append(String(format: "搜索范围已自动扩大至 ±%.3f mm。", range.1))
+        if let range = fitResult.searchRangeMm {
+            if range.1 > 0.0201 {
+                lines.append(String(format: "搜索范围已自动扩大至 ±%.3f mm。", range.1))
+            } else if !autoRange {
+                lines.append(String(format: "手动搜索范围 ±%.3f mm。", range.1))
+            }
         }
         if fitResult.boundaryLimited {
-            lines.append("最优解贴近搜索边界，请补点或检查点位。")
+            lines.append("结果受搜索边界限制，不可信；请补点或手动扩大搜索范围。")
         }
         if !outlierIndices.isEmpty {
             lines.append("已标记 \(outlierIndices.count) 个偏离较大的点。")
         }
         if candidate.outlierCount > 0 {
             lines.append("拟合计入 \(candidate.outlierCount) 个离群点（已降权）。")
+        }
+        if let lastFitDuration {
+            lines.append(String(format: "反推耗时 %.2f s。", lastFitDuration))
         }
         return lines.joined(separator: "\n")
     }
@@ -216,7 +279,7 @@ public final class CalibrationModel: ObservableObject {
         let sessionURL = outputDirectory.appendingPathComponent(Self.sessionFileName)
         try image.writePNG(to: patternURL)
 
-        let session = CalibrationSession(generation: snapshot, fitOptions: makeFitOptions())
+        let session = CalibrationSession(generation: snapshot, fitOptions: effectiveFitOptions)
         try CalibrationSessionStore.save(session, to: sessionURL)
 
         generation = snapshot
@@ -415,43 +478,162 @@ public final class CalibrationModel: ObservableObject {
 
     // MARK: - 反推
 
-    /// 用当前曲线反推参数。输入不足时 Core 会返回 `succeeded == false` 的结果而不是抛错。
+    /// 同步反推（回归测试 / 无 UI 场景）；界面走 `startFit()` 放到后台。
     public func fit() {
         guard rectificationConfirmed else {
             errorMessage = "请先确认照片矫正。"
             return
         }
+        if let validation = searchRangeValidationMessage {
+            errorMessage = validation
+            statusMessage = "无法反推：\(validation)"
+            return
+        }
+        guard !isFitting else { return }
         do {
             let session = try makeSession()
+            let started = Date()
             let result = try CalibrationCrossFitter.fit(
                 session: session,
                 points: tracePoints,
-                options: makeFitOptions()
+                options: effectiveFitOptions
             )
-            fitResult = result
-            if result.succeeded, !result.candidates.isEmpty {
-                selectedCandidateIndex = 0
-                refreshPrediction()
-                if let candidate = selectedCandidate, !candidate.isApplicable {
-                    statusMessage = result.rejectionReason ?? "候选偏差较大，暂时不能应用。"
-                } else {
-                    statusMessage = "已用全部 \(tracePoints.count) 点生成 \(result.candidates.count) 个候选；请核对橙色预测叠线。"
-                }
-            } else {
-                selectedCandidateIndex = nil
-                predictionOutline = []
-                pointDistances = []
-                statusMessage = result.warnings.first ?? "计算未通过，全部曲线点已保留。"
-            }
-            errorMessage = nil
+            applyFitResult(result, duration: Date().timeIntervalSince(started))
         } catch {
-            fitResult = nil
-            selectedCandidateIndex = nil
-            predictionOutline = []
-            pointDistances = []
+            clearFitOutputs()
             errorMessage = StudioModel.message(for: error)
             statusMessage = "反推失败：\(errorMessage ?? "")"
         }
+    }
+
+    /// 后台反推：主线程立即可交互、显示不确定进度、可取消。
+    ///
+    /// 结果回来时用 `inputRevision` 校验曲线/会话是否已变；过期结果直接丢弃。
+    public func startFit() {
+        guard !isFitting else { return }
+        guard rectificationConfirmed else {
+            errorMessage = "请先确认照片矫正。"
+            return
+        }
+        if let validation = searchRangeValidationMessage {
+            errorMessage = validation
+            statusMessage = "无法反推：\(validation)"
+            return
+        }
+        do {
+            let session = try makeSession()
+            let points = tracePoints
+            let options = effectiveFitOptions
+            let revision = inputRevision
+            let cancellation = CancellationFlag()
+            fitCancellation = cancellation
+            isFitting = true
+            fitProgress = nil
+            errorMessage = nil
+            statusMessage = "正在后台反推参数（\(points.count) 个曲线点）…"
+            let started = Date()
+            let model = self
+            fitTask = Task.detached(priority: .userInitiated) { [model, session, points, options, cancellation, revision, started] in
+                do {
+                    let result = try CalibrationCrossFitter.fit(
+                        session: session,
+                        points: points,
+                        options: options,
+                        cancellation: cancellation
+                    )
+                    let duration = Date().timeIntervalSince(started)
+                    await MainActor.run {
+                        guard model.fitCancellation === cancellation else { return }
+                        model.finishFit(result: result, duration: duration, revision: revision)
+                    }
+                } catch is CancellationError {
+                    await MainActor.run {
+                        guard model.fitCancellation === cancellation else { return }
+                        model.finishFitCancelled()
+                    }
+                } catch {
+                    let message = Self.errorText(for: error)
+                    await MainActor.run {
+                        guard model.fitCancellation === cancellation else { return }
+                        model.finishFitFailed(message: message)
+                    }
+                }
+            }
+        } catch {
+            isFitting = false
+            fitCancellation = nil
+            errorMessage = StudioModel.message(for: error)
+            statusMessage = "反推失败：\(errorMessage ?? "")"
+        }
+    }
+
+    /// 取消后台反推：保留曲线点，不弹错误框。
+    public func cancelFit() {
+        guard isFitting else { return }
+        fitCancellation?.cancel()
+        statusMessage = "正在取消反推…"
+    }
+
+    private func finishFit(result: CalibrationFitResult, duration: TimeInterval, revision: Int) {
+        isFitting = false
+        fitProgress = nil
+        fitCancellation = nil
+        fitTask = nil
+        guard revision == inputRevision else {
+            statusMessage = "曲线或会话已变化，已丢弃过期反推结果。"
+            return
+        }
+        applyFitResult(result, duration: duration)
+    }
+
+    private func finishFitCancelled() {
+        isFitting = false
+        fitProgress = nil
+        fitCancellation = nil
+        fitTask = nil
+        errorMessage = nil
+        statusMessage = "已取消反推，曲线点已保留。"
+    }
+
+    private func finishFitFailed(message: String) {
+        isFitting = false
+        fitProgress = nil
+        fitCancellation = nil
+        fitTask = nil
+        clearFitOutputs()
+        errorMessage = message
+        statusMessage = "反推失败：\(message)"
+    }
+
+    private func applyFitResult(_ result: CalibrationFitResult, duration: TimeInterval) {
+        fitResult = result
+        lastFitDuration = duration
+        if result.succeeded, !result.candidates.isEmpty {
+            selectedCandidateIndex = 0
+            refreshPrediction()
+            if let candidate = selectedCandidate, !candidate.isApplicable {
+                statusMessage = (result.rejectionReason ?? "候选偏差较大，暂时不能应用。")
+                    + String(format: "（反推 %.2f s）", duration)
+            } else {
+                statusMessage = "已用全部 \(tracePoints.count) 个点生成 \(result.candidates.count) 个候选，反推耗时 "
+                    + String(format: "%.2f s；请核对橙色预测叠线。", duration)
+            }
+        } else {
+            selectedCandidateIndex = nil
+            predictionOutline = []
+            pointDistances = []
+            statusMessage = (result.warnings.first ?? "计算未通过，全部曲线点已保留。")
+                + String(format: "（反推 %.2f s）", duration)
+        }
+        errorMessage = nil
+    }
+
+    private func clearFitOutputs() {
+        fitResult = nil
+        selectedCandidateIndex = nil
+        predictionOutline = []
+        pointDistances = []
+        lastFitDuration = nil
     }
 
     public func selectCandidate(at index: Int) {
@@ -481,7 +663,7 @@ public final class CalibrationModel: ObservableObject {
                 traces: traces
             )
         }
-        let session = CalibrationSession(generation: generation, photo: photo, fitOptions: makeFitOptions())
+        let session = CalibrationSession(generation: generation, photo: photo, fitOptions: effectiveFitOptions)
         try session.validate()
         return session
     }
@@ -503,6 +685,8 @@ public final class CalibrationModel: ObservableObject {
     /// 恢复一份会话：照片、边界、盘片规格与曲线点；候选不恢复。
     public func loadSession(_ session: CalibrationSession) throws {
         try session.validate()
+        // 打开新记录时丢弃正在跑的反推，并让旧结果因 revision 过期。
+        invalidateFit()
         generation = session.generation
         patternImage = nil
         generatedPatternURL = nil
@@ -547,7 +731,13 @@ public final class CalibrationModel: ObservableObject {
                 step = .trace
             }
         }
-        fitDvdPitch = session.fitOptions?.fitDvdPitch ?? fitDvdPitch
+        if let options = session.fitOptions {
+            fitDvdPitch = options.fitDvdPitch
+            autoRange = options.autoRange
+            if !options.autoRange {
+                manualSearchRangeMm = options.searchRangeMm
+            }
+        }
         statusMessage = "已恢复标定记录：生成快照、照片、轮廓与曲线点都在；候选需要重新反推。"
         errorMessage = nil
     }
@@ -587,18 +777,16 @@ public final class CalibrationModel: ObservableObject {
 
     // MARK: - 内部
 
-    private func makeFitOptions() -> CalibrationFitOptions {
-        var options = CalibrationFitOptions.default
-        options.fitDvdPitch = fitDvdPitch && (generation?.geometry.family == .dvd)
-        options.adaptiveRobustScale = true
-        return options
-    }
-
     private func invalidateFit(message: String? = nil) {
-        fitResult = nil
-        selectedCandidateIndex = nil
-        predictionOutline = []
-        pointDistances = []
+        inputRevision &+= 1
+        if isFitting {
+            fitCancellation?.cancel()
+            fitCancellation = nil
+            fitTask = nil
+            isFitting = false
+            fitProgress = nil
+        }
+        clearFitOutputs()
         if let message {
             statusMessage = message
         }
@@ -659,6 +847,14 @@ public final class CalibrationModel: ObservableObject {
             pointDistances = []
             errorMessage = StudioModel.message(for: error)
         }
+    }
+
+    /// 非主线程可用的错误文案（后台作业里不能调 `StudioModel.message`）。
+    private nonisolated static func errorText(for error: Error) -> String {
+        if let localized = error as? LocalizedError, let description = localized.errorDescription {
+            return description
+        }
+        return error.localizedDescription
     }
 
     private func nearestTraceIndex(to point: CalibrationPoint) -> Int? {

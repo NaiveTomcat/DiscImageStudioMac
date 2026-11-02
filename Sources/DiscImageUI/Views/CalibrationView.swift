@@ -232,8 +232,13 @@ public struct CalibrationView: View {
                 StatusBanner(.error, error)
             }
             HStack(spacing: 8) {
-                Image(systemName: calibration.step == .photo ? "1.circle" : "2.circle")
-                    .foregroundStyle(UITheme.accent)
+                if calibration.isFitting {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: calibration.step == .photo ? "1.circle" : "2.circle")
+                        .foregroundStyle(UITheme.accent)
+                }
                 Text(calibration.statusMessage)
                     .font(.caption)
                     .foregroundStyle(UITheme.textSecondary)
@@ -410,6 +415,43 @@ public struct CalibrationView: View {
                         .font(.caption)
                 }
 
+                Toggle("自动扩大搜索范围（±0.02 → 0.1 → 0.5 mm）", isOn: $calibration.autoRange)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+
+                if calibration.autoRange {
+                    Text("自动档位：±0.02 → ±0.1 → ±0.5 mm；最优解贴边时自动扩大后再算。")
+                        .font(.caption2)
+                        .foregroundStyle(UITheme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    HStack(spacing: 8) {
+                        Text("手动范围 ±")
+                            .font(.caption)
+                            .foregroundStyle(UITheme.textSecondary)
+                        TextField("0.020", value: $calibration.manualSearchRangeMm, format: .number.precision(.fractionLength(3)))
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption.monospacedDigit())
+                            .frame(width: 74)
+                        Text("mm")
+                            .font(.caption)
+                            .foregroundStyle(UITheme.textSecondary)
+                        Spacer()
+                    }
+                    Slider(
+                        value: $calibration.manualSearchRangeMm,
+                        in: CalibrationModel.manualSearchRangeLimits,
+                        step: CalibrationModel.manualSearchRangeStep
+                    )
+                    .disabled(calibration.isFitting)
+                    if let error = calibration.searchRangeValidationMessage {
+                        Text(error)
+                            .font(.caption2)
+                            .foregroundStyle(UITheme.danger)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
                 Text("矫正已确认后：点击空白加点、拖动圆点修正、Delete 或下方按钮删点。")
                     .font(.caption2)
                     .foregroundStyle(UITheme.textTertiary)
@@ -417,20 +459,38 @@ public struct CalibrationView: View {
 
                 HStack(spacing: 8) {
                     Button {
-                        calibration.fit()
+                        calibration.startFit()
                     } label: {
-                        Label("反推参数", systemImage: "function")
+                        Label(
+                            calibration.isFitting ? "正在后台反推…" : "反推参数",
+                            systemImage: calibration.isFitting ? "hourglass" : "function"
+                        )
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(UITheme.accent)
-                    .disabled(!calibration.canFit)
+                    .disabled(!calibration.canStartFit)
 
-                    Button("删除选中点") { calibration.removeSelectedTracePoint() }
-                        .buttonStyle(.bordered)
-                        .disabled(calibration.selectedTraceIndex == nil)
+                    if calibration.isFitting {
+                        Button("取消反推") { calibration.cancelFit() }
+                            .buttonStyle(.bordered)
+                    } else {
+                        Button("删除选中点") { calibration.removeSelectedTracePoint() }
+                            .buttonStyle(.bordered)
+                            .disabled(calibration.selectedTraceIndex == nil)
+                    }
                     Button("清空曲线") { calibration.clearTrace() }
                         .buttonStyle(.bordered)
-                        .disabled(calibration.tracePoints.isEmpty)
+                        .disabled(calibration.tracePoints.isEmpty || calibration.isFitting)
+                }
+
+                if calibration.isFitting {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("计算中…（主线程不受影响，可随时取消）")
+                            .font(.caption2)
+                            .foregroundStyle(UITheme.textSecondary)
+                    }
                 }
 
                 Text(calibration.fitAssessment)
@@ -467,6 +527,10 @@ public struct CalibrationView: View {
                             ), monospaced: true)
                         }
                     }
+                }
+
+                if calibration.fitResult?.boundaryLimited == true {
+                    StatusBanner(.warning, "结果受搜索边界限制，不可信；请补点，或关闭自动档位后手动扩大搜索范围再算。")
                 }
 
                 if let rejection = calibration.selectedCandidateRejectionReason,

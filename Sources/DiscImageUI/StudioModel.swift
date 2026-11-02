@@ -2,6 +2,21 @@ import DiscImageCore
 import Foundation
 import SwiftUI
 
+/// 8192 px 合成图导出的后台作业状态。
+///
+/// `running` 只表示「后台正在合成/写盘」；所有 SwiftUI 状态只在主线程更新。
+public enum CompositeExportState: Equatable, Sendable {
+    case idle
+    case running(size: Int)
+    case succeeded(url: URL, size: Int, duration: TimeInterval)
+    case failed(message: String)
+
+    public var isRunning: Bool {
+        if case .running = self { return true }
+        return false
+    }
+}
+
 /// 应用状态：工程、页面、最近工程、图层缓存、预览与两个作业状态机。
 ///
 /// 单向依赖：UI 只依赖 `DiscImageCore` 的模型与引擎协议；引擎/刻录通过
@@ -88,6 +103,9 @@ public final class StudioModel: ObservableObject {
     /// 标定参数应用后亮起，直到新建/打开工程。界面用它显示「参数已更新」提示。
     @Published public private(set) var calibrationParametersUpdated = false
 
+    /// 设计页合成图导出的后台作业状态。
+    @Published public private(set) var compositeExportState: CompositeExportState = .idle
+
     public let generationJob = GenerationJob()
     public let burnWorkflow: BurnWorkflow
     /// 标定闭环的状态机（生成图案 → 照片矫正 → 曲线反推 → 应用）。
@@ -96,6 +114,7 @@ public final class StudioModel: ObservableObject {
     private let projectStore: ProjectStore
     private let recentStore: RecentProjectStore
     private let generationService: GenerationService
+    private var compositeExportTask: Task<Void, Never>?
 
     // MARK: - 初始化
 
@@ -503,6 +522,59 @@ public final class StudioModel: ObservableObject {
         return image
     }
 
+    /// 后台导出合成图（设计页按钮：8192 px）。
+    ///
+    /// 点击后立即返回；合成与 PNG 编码都在后台线程，只有状态更新回主线程。
+    /// 重复触发会被忽略（`compositeExportState.isRunning`）。
+    public func startCompositeExport(to url: URL, size: Int = DesignComposer.exportSize) {
+        guard !compositeExportState.isRunning else { return }
+        let layers = project.layers
+        let images = layerImages
+        let radius = project.canvasOuterRadiusMm
+        if layers.isEmpty {
+            compositeExportState = .failed(message: "画布上没有图层，无法导出合成图。")
+            return
+        }
+        compositeExportState = .running(size: size)
+        statusMessage = "正在后台导出合成图 \(size)×\(size)…"
+
+        let model = self
+        compositeExportTask = Task.detached(priority: .userInitiated) {
+            let started = Date()
+            do {
+                let image = try DesignComposer.compose(
+                    layers: layers,
+                    layerImages: images,
+                    canvasOuterRadiusMm: radius,
+                    outputSize: size
+                )
+                try FileManager.default.createDirectory(
+                    at: url.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try image.writePNG(to: url)
+                let duration = Date().timeIntervalSince(started)
+                await MainActor.run {
+                    model.compositeExportState = .succeeded(url: url, size: size, duration: duration)
+                    model.statusMessage = "已导出合成图 \(size)×\(size)：\(url.path)"
+                }
+            } catch {
+                let message = Self.message(for: error)
+                await MainActor.run {
+                    model.compositeExportState = .failed(message: message)
+                    model.alertMessage = "导出合成图失败：\(message)"
+                    model.statusMessage = "导出合成图失败：\(message)"
+                }
+            }
+        }
+    }
+
+    /// 取消/重置后台导出状态（只清状态，不删除已写好的文件）。
+    public func resetCompositeExportState() {
+        guard !compositeExportState.isRunning else { return }
+        compositeExportState = .idle
+    }
+
     /// 盘面预览导出（预览页按钮：2048 px）。
     public func exportDiscPreview(to url: URL, size: Int = DesignComposer.previewSize) throws {
         let image = try DiscPreviewRenderer.render(
@@ -554,7 +626,7 @@ public final class StudioModel: ObservableObject {
 
     // MARK: - 错误文案
 
-    public static func message(for error: Error) -> String {
+    public nonisolated static func message(for error: Error) -> String {
         if let localized = error as? LocalizedError, let description = localized.errorDescription {
             return description
         }

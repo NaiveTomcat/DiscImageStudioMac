@@ -5,12 +5,17 @@ import SwiftUI
 
 /// 第一步：在实拍照片上拖动两组控制点（实体外缘 / 中心孔）。
 ///
-/// 坐标换算：`CalibrationPoint` 是照片像素、y 向下；界面按「等比缩放 + 居中」显示。
+/// 视图变换（缩放/平移）只作用于显示；拖点的结果仍是照片像素坐标。
+/// 坐标入口统一走 `PhotoCanvasMapping`（letterbox + zoom + pan）。
 struct CalibrationPhotoCanvas: View {
     let image: RasterImage
     let outerBoundary: [CalibrationPoint]
     let holeBoundary: [CalibrationPoint]
     let onMove: (CalibrationModel.BoundaryKind, Int, CalibrationPoint) -> Void
+
+    @State private var viewport = CanvasViewport()
+    @State private var panStart: CGSize?
+    @State private var magnifyStart: CanvasViewport?
 
     private static let space = "calibration.photo"
 
@@ -20,41 +25,68 @@ struct CalibrationPhotoCanvas: View {
                 imageSize: CGSize(width: image.width, height: image.height),
                 bounds: proxy.size
             )
+            let centre = CGPoint(x: proxy.size.width / 2, y: proxy.size.height / 2)
+            let mapping = PhotoCanvasMapping(layout: layout, viewport: viewport, centre: centre)
+            let imageCentre = CGPoint(x: centre.x + viewport.pan.width, y: centre.y + viewport.pan.height)
+
             ZStack {
                 RoundedRectangle(cornerRadius: 14)
                     .fill(UITheme.canvasBackground)
+
+                ScrollWheelZoomCatcher { delta, point in
+                    viewport = viewport.zoomed(
+                        by: pow(1.002, delta),
+                        at: point,
+                        centre: centre
+                    )
+                }
+                .allowsHitTesting(false)
 
                 if let cgImage = makeCGImage(from: image) {
                     Image(decorative: cgImage, scale: 1)
                         .resizable()
                         .interpolation(.medium)
-                        .frame(width: layout.imageRect.width, height: layout.imageRect.height)
-                        .position(x: layout.imageRect.midX, y: layout.imageRect.midY)
-                        .overlay {
-                            Rectangle()
-                                .stroke(UITheme.panelBorder, lineWidth: 1)
-                                .frame(width: layout.imageRect.width, height: layout.imageRect.height)
-                                .position(x: layout.imageRect.midX, y: layout.imageRect.midY)
-                        }
+                        .frame(
+                            width: layout.imageRect.width * viewport.zoom,
+                            height: layout.imageRect.height * viewport.zoom
+                        )
+                        .position(imageCentre)
                 }
+
+                // 空白处拖动平移（控制点在上层，拖动仍优先移动点）。
+                Rectangle()
+                    .fill(Color.clear)
+                    .contentShape(Rectangle())
+                    .gesture(panGesture())
 
                 ForEach(Array(outerBoundary.enumerated()), id: \.offset) { index, point in
                     controlPoint(
-                        at: layout.displayPoint(point),
+                        at: mapping.displayPoint(point),
                         colour: UITheme.accent,
-                        label: "外\(index + 1)"
+                        label: "外\(index + 1)",
+                        zoom: viewport.zoom
                     )
-                    .gesture(dragGesture(kind: .outer, index: index, layout: layout))
+                    .gesture(dragGesture(kind: .outer, index: index, mapping: mapping))
                 }
 
                 ForEach(Array(holeBoundary.enumerated()), id: \.offset) { index, point in
                     controlPoint(
-                        at: layout.displayPoint(point),
+                        at: mapping.displayPoint(point),
                         colour: Color(red: 0.98, green: 0.45, blue: 0.72),
-                        label: "孔\(index + 1)"
+                        label: "孔\(index + 1)",
+                        zoom: viewport.zoom
                     )
-                    .gesture(dragGesture(kind: .hole, index: index, layout: layout))
+                    .gesture(dragGesture(kind: .hole, index: index, mapping: mapping))
                 }
+
+                VStack {
+                    HStack {
+                        Spacer()
+                        CanvasZoomToolbar(viewport: viewport) { viewport.reset() }
+                    }
+                    Spacer()
+                }
+                .padding(10)
             }
             .coordinateSpace(name: Self.space)
             .clipShape(RoundedRectangle(cornerRadius: 14))
@@ -62,19 +94,25 @@ struct CalibrationPhotoCanvas: View {
                 RoundedRectangle(cornerRadius: 14)
                     .stroke(UITheme.panelBorder, lineWidth: 1)
             )
+            .contentShape(Rectangle())
+            .simultaneousGesture(
+                TapGesture(count: 2).onEnded { viewport.reset() }
+            )
+            .simultaneousGesture(magnifyGesture(centre: centre))
         }
     }
 
-    private func controlPoint(at point: CGPoint, colour: Color, label: String) -> some View {
-        Circle()
+    private func controlPoint(at point: CGPoint, colour: Color, label: String, zoom: CGFloat) -> some View {
+        let size = 13 * min(max(zoom, 0.6), 2.2)
+        return Circle()
             .fill(colour.opacity(0.22))
             .overlay(Circle().stroke(colour, lineWidth: 1.5))
-            .frame(width: 13, height: 13)
+            .frame(width: size, height: size)
             .overlay(
                 Text(label)
                     .font(.system(size: 7, weight: .semibold))
                     .foregroundStyle(colour)
-                    .offset(y: -11)
+                    .offset(y: -size * 0.85)
             )
             .position(point)
             .contentShape(Circle())
@@ -84,16 +122,43 @@ struct CalibrationPhotoCanvas: View {
     private func dragGesture(
         kind: CalibrationModel.BoundaryKind,
         index: Int,
-        layout: PhotoLayout
+        mapping: PhotoCanvasMapping
     ) -> some Gesture {
         DragGesture(minimumDistance: 0, coordinateSpace: .named(Self.space))
             .onChanged { value in
-                onMove(kind, index, layout.imagePoint(fromDisplay: value.location))
+                onMove(kind, index, mapping.imagePoint(value.location))
             }
+    }
+
+    private func panGesture() -> some Gesture {
+        DragGesture(minimumDistance: 3, coordinateSpace: .named(Self.space))
+            .onChanged { value in
+                if panStart == nil { panStart = viewport.pan }
+                guard let panStart else { return }
+                viewport.pan = CGSize(
+                    width: panStart.width + value.translation.width,
+                    height: panStart.height + value.translation.height
+                )
+            }
+            .onEnded { _ in panStart = nil }
+    }
+
+    private func magnifyGesture(centre: CGPoint) -> some Gesture {
+        MagnifyGesture()
+            .onChanged { value in
+                if magnifyStart == nil { magnifyStart = viewport }
+                guard let magnifyStart else { return }
+                viewport = magnifyStart.zoomed(
+                    by: max(value.magnification, 0.01),
+                    at: value.startLocation,
+                    centre: centre
+                )
+            }
+            .onEnded { _ in magnifyStart = nil }
     }
 }
 
-/// 照片在给定区域内的等比布局。
+/// 照片在给定区域内的等比布局（「适合窗口」的 base 坐标）。
 struct PhotoLayout {
     let imageRect: CGRect
     let scale: CGFloat
@@ -136,9 +201,8 @@ struct PhotoLayout {
 
 /// 第二步：在矫正后的正视盘面上描一条从内到外的径向曲线。
 ///
-/// - 点击空白：加点；
-/// - 拖动圆点：移动已有点并选中；
-/// - Delete（或面板上的按钮）：删除选中点；
+/// - 点击空白：加点；拖动圆点：移动已有点并选中；
+/// - 拖动空白：平移；滚轮/捏合：以光标为中心缩放；双击：复位；
 /// - 橙色折线：候选参数的预测曲线；红色点：与预测偏差较大的点。
 struct CalibrationTraceCanvas: View {
     let image: RasterImage?
@@ -153,47 +217,73 @@ struct CalibrationTraceCanvas: View {
     let onMove: (Int, CalibrationPoint) -> Void
     let onDelete: () -> Void
 
+    @State private var viewport = CanvasViewport()
+    @State private var panStart: CGSize?
+    @State private var magnifyStart: CanvasViewport?
+    @State private var lastTap: (time: Date, location: CGPoint)?
+
     private static let space = "calibration.trace"
 
     var body: some View {
         GeometryReader { proxy in
             let side = max(min(proxy.size.width, proxy.size.height) - 24, 80)
             let centre = CGPoint(x: proxy.size.width / 2, y: proxy.size.height / 2)
-            let mmPerPoint = canvasOuterRadiusMm * 2 / Double(side)
+            let mapping = TraceCanvasMapping(
+                canvasOuterRadiusMm: canvasOuterRadiusMm,
+                side: side,
+                centre: centre,
+                viewport: viewport
+            )
 
             ZStack {
                 RoundedRectangle(cornerRadius: 14)
                     .fill(UITheme.canvasBackground)
 
+                ScrollWheelZoomCatcher { delta, point in
+                    viewport = viewport.zoomed(by: pow(1.002, delta), at: point, centre: centre)
+                }
+                .allowsHitTesting(false)
+
                 if let image, let cgImage = makeCGImage(from: image) {
                     Image(decorative: cgImage, scale: 1)
                         .resizable()
                         .interpolation(.high)
-                        .frame(width: side, height: side)
-                        .position(centre)
+                        .frame(width: mapping.scaledSide(), height: mapping.scaledSide())
+                        .position(
+                            x: centre.x + viewport.pan.width,
+                            y: centre.y + viewport.pan.height
+                        )
                 }
 
-                rings(centre: centre, side: side, mmPerPoint: mmPerPoint)
+                rings(mapping: mapping)
 
-                // 空白区域点击加点（放在图上、点下面，避免抢点的拖动）。
+                // 空白区域：点击加点 / 拖动平移。
                 Rectangle()
                     .fill(Color.clear)
                     .contentShape(Rectangle())
-                    .frame(width: side, height: side)
-                    .position(centre)
-                    .gesture(
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .gesture(panGesture())
+                    .simultaneousGesture(
                         SpatialTapGesture(coordinateSpace: .named(Self.space))
                             .onEnded { value in
-                                onAdd(discPoint(
-                                    display: value.location,
-                                    centre: centre,
-                                    mmPerPoint: mmPerPoint
-                                ))
+                                // 双击复位（第一次点击加的点在第二次点击时被选中，这里删掉它）。
+                                let now = Date()
+                                if let lastTap,
+                                   now.timeIntervalSince(lastTap.time) < 0.35,
+                                   hypot(value.location.x - lastTap.location.x,
+                                         value.location.y - lastTap.location.y) < 8 {
+                                    self.lastTap = nil
+                                    onDelete()
+                                    viewport.reset()
+                                    return
+                                }
+                                self.lastTap = (now, value.location)
+                                onAdd(mapping.discPoint(value.location))
                             }
                     )
 
                 if prediction.count >= 2 {
-                    predictionPath(centre: centre, mmPerPoint: mmPerPoint)
+                    predictionPath(mapping: mapping)
                         .stroke(
                             Color(red: 1.0, green: 0.62, blue: 0.2),
                             style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round)
@@ -212,22 +302,24 @@ struct CalibrationTraceCanvas: View {
                             )
                         )
                         .frame(width: isSelected ? 11 : 8, height: isSelected ? 11 : 8)
-                        .position(displayPoint(point, centre: centre, mmPerPoint: mmPerPoint))
+                        .position(mapping.displayPoint(point))
                         .contentShape(Circle().inset(by: -4))
                         .gesture(
                             DragGesture(minimumDistance: 0, coordinateSpace: .named(Self.space))
                                 .onChanged { value in
-                                    onMove(
-                                        index,
-                                        discPoint(
-                                            display: value.location,
-                                            centre: centre,
-                                            mmPerPoint: mmPerPoint
-                                        )
-                                    )
+                                    onMove(index, mapping.discPoint(value.location))
                                 }
                         )
                 }
+
+                VStack {
+                    HStack {
+                        Spacer()
+                        CanvasZoomToolbar(viewport: viewport) { viewport.reset() }
+                    }
+                    Spacer()
+                }
+                .padding(10)
             }
             .coordinateSpace(name: Self.space)
             .clipShape(RoundedRectangle(cornerRadius: 14))
@@ -235,18 +327,24 @@ struct CalibrationTraceCanvas: View {
                 RoundedRectangle(cornerRadius: 14)
                     .stroke(UITheme.panelBorder, lineWidth: 1)
             )
+            .contentShape(Rectangle())
             .focusable()
             .onDeleteCommand(perform: onDelete)
+            .simultaneousGesture(magnifyGesture(centre: centre))
         }
     }
 
-    private func rings(centre: CGPoint, side: CGFloat, mmPerPoint: Double) -> some View {
+    private func rings(mapping: TraceCanvasMapping) -> some View {
         Canvas { context, _ in
+            let displayCentre = CGPoint(
+                x: mapping.centre.x + mapping.viewport.pan.width,
+                y: mapping.centre.y + mapping.viewport.pan.height
+            )
             func circle(_ radiusMm: Double) -> Path {
-                let radius = CGFloat(radiusMm / mmPerPoint)
+                let radius = CGFloat(radiusMm / mapping.mmPerPoint) * mapping.viewport.zoom
                 return Path(ellipseIn: CGRect(
-                    x: centre.x - radius,
-                    y: centre.y - radius,
+                    x: displayCentre.x - radius,
+                    y: displayCentre.y - radius,
                     width: radius * 2,
                     height: radius * 2
                 ))
@@ -262,19 +360,19 @@ struct CalibrationTraceCanvas: View {
                 lineWidth: 1
             )
             var crosshair = Path()
-            crosshair.move(to: CGPoint(x: centre.x - 6, y: centre.y))
-            crosshair.addLine(to: CGPoint(x: centre.x + 6, y: centre.y))
-            crosshair.move(to: CGPoint(x: centre.x, y: centre.y - 6))
-            crosshair.addLine(to: CGPoint(x: centre.x, y: centre.y + 6))
+            crosshair.move(to: CGPoint(x: displayCentre.x - 6, y: displayCentre.y))
+            crosshair.addLine(to: CGPoint(x: displayCentre.x + 6, y: displayCentre.y))
+            crosshair.move(to: CGPoint(x: displayCentre.x, y: displayCentre.y - 6))
+            crosshair.addLine(to: CGPoint(x: displayCentre.x, y: displayCentre.y + 6))
             context.stroke(crosshair, with: .color(UITheme.textTertiary), lineWidth: 1)
         }
         .allowsHitTesting(false)
     }
 
-    private func predictionPath(centre: CGPoint, mmPerPoint: Double) -> Path {
+    private func predictionPath(mapping: TraceCanvasMapping) -> Path {
         var path = Path()
         for (index, point) in prediction.enumerated() {
-            let display = displayPoint(point, centre: centre, mmPerPoint: mmPerPoint)
+            let display = mapping.displayPoint(point)
             if index == 0 {
                 path.move(to: display)
             } else {
@@ -284,26 +382,31 @@ struct CalibrationTraceCanvas: View {
         return path
     }
 
-    private func displayPoint(
-        _ point: CalibrationPoint,
-        centre: CGPoint,
-        mmPerPoint: Double
-    ) -> CGPoint {
-        CGPoint(
-            x: centre.x + CGFloat(point.xMm / mmPerPoint),
-            y: centre.y + CGFloat(point.yMm / mmPerPoint)
-        )
+    private func panGesture() -> some Gesture {
+        DragGesture(minimumDistance: 3, coordinateSpace: .named(Self.space))
+            .onChanged { value in
+                if panStart == nil { panStart = viewport.pan }
+                guard let panStart else { return }
+                viewport.pan = CGSize(
+                    width: panStart.width + value.translation.width,
+                    height: panStart.height + value.translation.height
+                )
+            }
+            .onEnded { _ in panStart = nil }
     }
 
-    private func discPoint(
-        display point: CGPoint,
-        centre: CGPoint,
-        mmPerPoint: Double
-    ) -> CalibrationPoint {
-        CalibrationPoint(
-            xMm: Double((point.x - centre.x)) * mmPerPoint,
-            yMm: Double((point.y - centre.y)) * mmPerPoint
-        )
+    private func magnifyGesture(centre: CGPoint) -> some Gesture {
+        MagnifyGesture()
+            .onChanged { value in
+                if magnifyStart == nil { magnifyStart = viewport }
+                guard let magnifyStart else { return }
+                viewport = magnifyStart.zoomed(
+                    by: max(value.magnification, 0.01),
+                    at: value.startLocation,
+                    centre: centre
+                )
+            }
+            .onEnded { _ in magnifyStart = nil }
     }
 }
 

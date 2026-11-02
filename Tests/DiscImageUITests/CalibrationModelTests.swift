@@ -1,6 +1,6 @@
 import DiscImageCore
-import DiscImageUI
 import XCTest
+@testable import DiscImageUI
 
 /// GUI 标定闭环：生成图案、照片矫正、曲线反推、应用参数、会话往返。
 @MainActor
@@ -260,6 +260,129 @@ final class CalibrationModelTests: XCTestCase {
         XCTAssertEqual(reopened.tracePoints.count, 9)
         XCTAssertTrue(reopened.rectificationConfirmed)
         XCTAssertNil(reopened.fitResult)
+    }
+
+    // MARK: - 后台反推 / 取消 / 手动范围
+
+    func testAsyncFitCompletesWithDuration() async throws {
+        let studio = makeStudioModel()
+        try prepareTraceStep(studio: studio)
+
+        studio.calibration.startFit()
+        XCTAssertTrue(studio.calibration.isFitting, "反推应在后台开始")
+        try await UITestSupport.waitUntil(timeout: 60) { !studio.calibration.isFitting }
+
+        XCTAssertNotNil(studio.calibration.fitResult)
+        let duration = try XCTUnwrap(studio.calibration.lastFitDuration)
+        XCTAssertGreaterThanOrEqual(duration, 0)
+        XCTAssertTrue(studio.calibration.statusMessage.contains("耗时"), studio.calibration.statusMessage)
+        XCTAssertNil(studio.calibration.errorMessage)
+        XCTAssertFalse(studio.calibration.isFitting)
+    }
+
+    func testCancelFitReturnsToIdleWithoutError() async throws {
+        let studio = makeStudioModel()
+        // 间距 >1.2 mm 才不会被「点已存在」的去重逻辑吞掉；12 个不同半径会走三次轨距拟合。
+        let radii = stride(from: 25.0, through: 39.0, by: 1.25).map { $0 }
+        try prepareTraceStep(studio: studio, pointRadii: radii)
+        let expectedCount = studio.calibration.tracePoints.count
+        XCTAssertEqual(expectedCount, 12)
+
+        studio.calibration.startFit()
+        XCTAssertTrue(studio.calibration.isFitting)
+        studio.calibration.cancelFit()
+
+        try await UITestSupport.waitUntil(timeout: 60) { !studio.calibration.isFitting }
+
+        XCTAssertNil(studio.calibration.fitResult, "取消后不应留下结果")
+        XCTAssertNil(studio.calibration.errorMessage, "取消不应弹错误框")
+        XCTAssertTrue(
+            studio.calibration.statusMessage.contains("已取消"),
+            "取消后状态行应提示已取消，实际：\(studio.calibration.statusMessage)"
+        )
+        XCTAssertEqual(studio.calibration.tracePoints.count, expectedCount, "取消必须保留全部曲线点")
+        XCTAssertFalse(studio.calibration.canApplySelectedCandidate)
+    }
+
+    /// Core 的取消契约：已取消的 Flag 必须抛 `CancellationError`（UI 据此静默回空闲）。
+    func testCoreFitterThrowsCancellationErrorWithPreCancelledFlag() throws {
+        let studio = makeStudioModel()
+        try prepareTraceStep(studio: studio)
+        let session = try studio.calibration.makeSession()
+        let flag = CancellationFlag()
+        flag.cancel()
+
+        XCTAssertThrowsError(try CalibrationCrossFitter.fit(
+            session: session,
+            points: studio.calibration.tracePoints,
+            options: studio.calibration.effectiveFitOptions,
+            cancellation: flag
+        )) { error in
+            XCTAssertTrue(error is CancellationError, "应抛 CancellationError，实际 \(error)")
+        }
+    }
+
+    func testManualSearchRangeValidationAndOptions() throws {
+        let studio = makeStudioModel()
+        try prepareTraceStep(studio: studio)
+
+        // 默认自动档：±0.02 起步、autoRange = true。
+        XCTAssertTrue(studio.calibration.autoRange)
+        XCTAssertNil(studio.calibration.searchRangeValidationMessage)
+        XCTAssertTrue(studio.calibration.effectiveFitOptions.autoRange)
+        XCTAssertEqual(studio.calibration.effectiveFitOptions.searchRangeMm, 0.02, accuracy: 1e-12)
+
+        studio.calibration.autoRange = false
+        studio.calibration.manualSearchRangeMm = 0.002
+        XCTAssertNotNil(studio.calibration.searchRangeValidationMessage)
+        XCTAssertFalse(studio.calibration.canStartFit)
+        studio.calibration.startFit()
+        XCTAssertFalse(studio.calibration.isFitting, "非法范围不应真的启动反推")
+        XCTAssertNotNil(studio.calibration.errorMessage)
+        XCTAssertNil(studio.calibration.fitResult)
+
+        studio.calibration.manualSearchRangeMm = 1.5
+        XCTAssertNotNil(studio.calibration.searchRangeValidationMessage)
+
+        studio.calibration.manualSearchRangeMm = 0.012
+        XCTAssertNotNil(studio.calibration.searchRangeValidationMessage)
+        XCTAssertTrue(studio.calibration.searchRangeValidationMessage?.contains("步进") ?? false)
+
+        studio.calibration.manualSearchRangeMm = 0.05
+        XCTAssertNil(studio.calibration.searchRangeValidationMessage)
+        XCTAssertTrue(studio.calibration.canStartFit)
+        let options = studio.calibration.effectiveFitOptions
+        XCTAssertFalse(options.autoRange)
+        XCTAssertEqual(options.searchRangeMm, 0.05, accuracy: 1e-12)
+    }
+
+    /// 缩放/平移只影响显示：会话里保存的照片 base64、边界、曲线点都不能变。
+    func testViewportTransformDoesNotChangeStoredPhotoCoordinates() throws {
+        let studio = makeStudioModel()
+        try prepareTraceStep(studio: studio)
+        let before = try XCTUnwrap(try studio.calibration.makeSession().photo)
+        let image = try XCTUnwrap(studio.calibration.photoImage)
+
+        let layout = PhotoLayout(
+            imageSize: CGSize(width: image.width, height: image.height),
+            bounds: CGSize(width: 640, height: 520)
+        )
+        let viewport = CanvasViewport(zoom: 3.2, pan: CGSize(width: 70, height: -30))
+        let mapping = PhotoCanvasMapping(
+            layout: layout,
+            viewport: viewport,
+            centre: CGPoint(x: 320, y: 260)
+        )
+        let imagePoint = CalibrationPoint(xMm: 100, yMm: 200)
+        let back = mapping.imagePoint(mapping.displayPoint(imagePoint))
+        XCTAssertEqual(back.xMm, imagePoint.xMm, accuracy: 1e-9)
+        XCTAssertEqual(back.yMm, imagePoint.yMm, accuracy: 1e-9)
+
+        let after = try XCTUnwrap(try studio.calibration.makeSession().photo)
+        XCTAssertEqual(after.imagePngBase64, before.imagePngBase64)
+        XCTAssertEqual(after.outerBoundary, before.outerBoundary)
+        XCTAssertEqual(after.holeBoundary, before.holeBoundary)
+        XCTAssertEqual(after.traces, before.traces)
     }
 
     func testResetClearsEverything() throws {

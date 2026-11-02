@@ -217,6 +217,82 @@ final class StudioModelTests: XCTestCase {
         XCTAssertEqual(preview.width, 256)
     }
 
+    // MARK: - 8192 px 合成图后台导出
+
+    @MainActor
+    func testBackgroundCompositeExportSucceeds() async throws {
+        let model = makeModel()
+        let layerURL = try UITestSupport.writePNG(
+            UITestSupport.gray(width: 64, height: 64, value: 180),
+            named: "background-layer.png",
+            in: scratch
+        )
+        _ = try model.addLayer(imageURL: layerURL)
+        let outputURL = scratch.appendingPathComponent("composite-8192.png")
+
+        model.startCompositeExport(to: outputURL, size: DesignComposer.exportSize)
+
+        guard case .running(let runningSize) = model.compositeExportState else {
+            XCTFail("点击后应立即进入后台运行态，实际 \(model.compositeExportState)")
+            return
+        }
+        XCTAssertEqual(runningSize, DesignComposer.exportSize)
+
+        // 重复触发应被忽略（不会排第二个作业）。
+        model.startCompositeExport(to: scratch.appendingPathComponent("duplicate.png"))
+
+        try await UITestSupport.waitUntil(timeout: 180) {
+            switch model.compositeExportState {
+            case .succeeded, .failed: return true
+            case .idle, .running: return false
+            }
+        }
+
+        guard case .succeeded(let url, let size, let duration) = model.compositeExportState else {
+            XCTFail("后台导出应成功，实际 \(model.compositeExportState)")
+            return
+        }
+        XCTAssertEqual(url, outputURL)
+        XCTAssertEqual(size, DesignComposer.exportSize)
+        XCTAssertGreaterThanOrEqual(duration, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outputURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: scratch.appendingPathComponent("duplicate.png").path),
+                       "重复点击不应再写第二个文件")
+        let image = try RasterImage.load(contentsOf: outputURL)
+        XCTAssertEqual(image.width, DesignComposer.exportSize)
+        XCTAssertEqual(image.height, DesignComposer.exportSize)
+        XCTAssertTrue(model.statusMessage?.contains(outputURL.path) ?? false)
+
+        model.resetCompositeExportState()
+        XCTAssertEqual(model.compositeExportState, .idle)
+    }
+
+    @MainActor
+    func testBackgroundCompositeExportFailureIsReadable() async throws {
+        let model = makeModel()
+        let layerURL = try UITestSupport.writePNG(
+            UITestSupport.gray(width: 32, height: 32, value: 90),
+            named: "failure-layer.png",
+            in: scratch
+        )
+        _ = try model.addLayer(imageURL: layerURL)
+
+        model.startCompositeExport(to: URL(fileURLWithPath: "/dev/null/never.png"), size: 256)
+        try await UITestSupport.waitUntil(timeout: 60) {
+            if case .failed = model.compositeExportState { return true }
+            if case .succeeded = model.compositeExportState { return true }
+            return false
+        }
+
+        guard case .failed(let message) = model.compositeExportState else {
+            XCTFail("写入不可用路径应失败，实际 \(model.compositeExportState)")
+            return
+        }
+        XCTAssertFalse(message.isEmpty)
+        XCTAssertNotNil(model.alertMessage)
+        XCTAssertTrue(model.statusMessage?.contains("失败") ?? false)
+    }
+
     func testOutputFormatSwitchingRewritesExtension() {
         let model = makeModel()
         XCTAssertEqual(model.project.outputFormat, .wav)

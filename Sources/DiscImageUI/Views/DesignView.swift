@@ -280,13 +280,20 @@ public struct DesignView: View {
             Divider().overlay(UITheme.panelBorder)
 
             Button {
-                exportComposite(size: DesignComposer.exportSize)
+                startCompositeExport()
             } label: {
-                Label("导出合成图（8192 px）", systemImage: "square.and.arrow.down")
-                    .frame(maxWidth: .infinity)
+                Label(
+                    model.compositeExportState.isRunning
+                        ? "正在导出 8192 px…"
+                        : "导出合成图（8192 px）",
+                    systemImage: model.compositeExportState.isRunning ? "hourglass" : "square.and.arrow.down"
+                )
+                .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
-            .disabled(model.project.layers.isEmpty)
+            .disabled(model.project.layers.isEmpty || model.compositeExportState.isRunning)
+
+            compositeExportStatus
 
             Button {
                 exportDiscPreview(size: DesignComposer.previewSize)
@@ -296,7 +303,7 @@ public struct DesignView: View {
             }
             .buttonStyle(.bordered)
 
-            Text("导出文件写到当前工程的输出目录；预览为设计投影，不代表最终读回。")
+            Text("导出在后台执行，按钮会立即返回；完成/失败都会显示结果。预览为设计投影，不代表最终读回。")
                 .font(.caption2)
                 .foregroundStyle(UITheme.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -327,15 +334,44 @@ public struct DesignView: View {
         return URL(fileURLWithPath: path).deletingLastPathComponent()
     }
 
-    private func exportComposite(size: Int) {
+    @ViewBuilder
+    private var compositeExportStatus: some View {
+        switch model.compositeExportState {
+        case .idle:
+            EmptyView()
+        case .running(let size):
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("正在后台合成 \(size)×\(size) 图并写盘…")
+                    .font(.caption2)
+                    .foregroundStyle(UITheme.textSecondary)
+            }
+        case .succeeded(let url, let size, let duration):
+            VStack(alignment: .leading, spacing: 2) {
+                Text("已导出 \(size)×\(size)，用时 \(String(format: "%.1f", duration)) s")
+                    .font(.caption2)
+                    .foregroundStyle(UITheme.success)
+                Text(url.path)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(UITheme.textTertiary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+        case .failed(let message):
+            Text("导出失败：\(message)")
+                .font(.caption2)
+                .foregroundStyle(UITheme.danger)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func startCompositeExport() {
+        let size = DesignComposer.exportSize
         let url = exportDirectory.appendingPathComponent(
             "\(ProjectNaming.sanitizedFileStem(model.project.name))-composite-\(size).png"
         )
-        do {
-            _ = try model.exportComposite(to: url, size: size)
-        } catch {
-            model.alertMessage = StudioModel.message(for: error)
-        }
+        model.startCompositeExport(to: url, size: size)
     }
 
     private func exportDiscPreview(size: Int) {
