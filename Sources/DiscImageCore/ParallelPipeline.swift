@@ -24,8 +24,9 @@ public enum ParallelPipeline {
     ///
     /// - Parameters:
     ///   - count: 块总数
-    ///   - chunkSize: 一次并行处理的块数（同时决定内存上界）
-    ///   - workers: 并行度；1 表示退化为串行（便于对拍）
+    ///   - chunkSize: 一次并行处理的块数（决定内存上界；建议 >= workers）
+    ///   - workers: **实际并发度**（把 chunk 切成这么多个连续区间并行跑）；
+    ///     1 表示退化为串行（便于逐字节对拍）
     ///   - cancellation: 每块开始前检查
     ///   - produce: 计算第 i 块（必须无副作用，只依赖 i）
     ///   - consume: 按 0,1,2… 顺序接收就绪的块
@@ -61,11 +62,22 @@ public enum ParallelPipeline {
                         failure.set(error)
                     }
                 }
-                // 块太少时开线程只赔不赚。
-                if workers <= 1 || blockCount < workers * 2 {
+                // 把本组切成 `lanes` 个连续区间并行跑：既保证并发度恰好是
+                // `workers`（不会因为 chunkSize 大而开出几十个线程），又保持
+                // 每个区间内部的顺序，便于 produce 复用缓存。
+                let lanes = max(1, min(workers, blockCount))
+                if lanes == 1 {
                     for offset in 0..<blockCount { compute(offset) }
                 } else {
-                    DispatchQueue.concurrentPerform(iterations: blockCount, execute: compute)
+                    DispatchQueue.concurrentPerform(iterations: lanes) { lane in
+                        let lower = blockCount * lane / lanes
+                        let upper = blockCount * (lane + 1) / lanes
+                        var offset = lower
+                        while offset < upper {
+                            compute(offset)
+                            offset += 1
+                        }
+                    }
                 }
             }
 
