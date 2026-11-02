@@ -336,6 +336,48 @@ final class DvdGeneratorTests: XCTestCase {
         XCTAssertEqual(lastFraction, 1, accuracy: 1e-9)
     }
 
+    // MARK: - 可复现性 / 串行与并行一致
+
+    func testSourceDateEpochPinsGenerationTimestamp() {
+        let pinned = DvdImageGenerator.generationTimestamp(
+            environment: ["SOURCE_DATE_EPOCH": "1793605888.14"]
+        )
+        XCTAssertEqual(pinned.timeIntervalSince1970, 1793605888.14, accuracy: 1e-6)
+
+        // 未设置时退回「现在」，并且非法值不参与（走默认）。
+        XCTAssertEqual(
+            DvdImageGenerator.generationTimestamp(environment: [:]).timeIntervalSinceNow,
+            0,
+            accuracy: 30
+        )
+        XCTAssertEqual(
+            DvdImageGenerator.generationTimestamp(environment: ["SOURCE_DATE_EPOCH": "not-a-number"])
+                .timeIntervalSinceNow,
+            0,
+            accuracy: 30
+        )
+    }
+
+    /// 串行（`DISCI_MAX_WORKERS=1`）与默认并行必须逐字节一致。
+    /// 用 `SOURCE_DATE_EPOCH` 钉住 ISO 的日期字段，否则时间戳会让每次输出不同。
+    func testSerialAndParallelOutputsAreIdentical() throws {
+        let previousEpoch = ProcessInfo.processInfo.environment["SOURCE_DATE_EPOCH"]
+        let previousWorkers = ProcessInfo.processInfo.environment["DISCI_MAX_WORKERS"]
+        defer {
+            if let value = previousEpoch { setenv("SOURCE_DATE_EPOCH", value, 1) } else { unsetenv("SOURCE_DATE_EPOCH") }
+            if let value = previousWorkers { setenv("DISCI_MAX_WORKERS", value, 1) } else { unsetenv("DISCI_MAX_WORKERS") }
+        }
+        setenv("SOURCE_DATE_EPOCH", "1793605888.14", 1)
+
+        let request = request(image: RasterImage.gray(width: 16, height: 16, value: 128))
+        setenv("DISCI_MAX_WORKERS", "1", 1)
+        let serial = try generate(request)
+        setenv("DISCI_MAX_WORKERS", "8", 1)
+        let parallel = try generate(request)
+        XCTAssertEqual(serial, parallel, "并行与串行的输出必须逐字节一致")
+        XCTAssertEqual(serial.count, sectors * 2048)
+    }
+
     // MARK: - 供 hdiutil 实测的产物
 
     /// 生成一个可挂载的 ISO 到 `.build/verify/`（不自动删除，供

@@ -39,6 +39,8 @@ public struct DvdImageGenerator: DiscImageGenerator {
         }
         let sectors = geometry.sectors
         let totalBytes = Int64(sectors) * Int64(Iso9660Writer.logicalSectorBytes)
+        // ISO 的日期字段默认是「现在」；回归/可复现构建时用 SOURCE_DATE_EPOCH 钉住。
+        let timestamp = Self.generationTimestamp()
         var lastReportedFraction = -Double.infinity
         // 本地节流器：每 1% 回调一次，避免 UI 被每个 Block 淹没。
         func emit(_ stage: String, _ message: String, _ fraction: Double) {
@@ -62,7 +64,8 @@ public struct DvdImageGenerator: DiscImageGenerator {
                 painter: painter,
                 sink: sink,
                 emit: emit,
-                totalBytes: totalBytes
+                totalBytes: totalBytes,
+                timestamp: timestamp
             )
         }
         return try generateDrawing(
@@ -70,7 +73,8 @@ public struct DvdImageGenerator: DiscImageGenerator {
             painter: painter,
             sink: sink,
             emit: emit,
-            totalBytes: totalBytes
+            totalBytes: totalBytes,
+            timestamp: timestamp
         )
     }
 
@@ -81,7 +85,8 @@ public struct DvdImageGenerator: DiscImageGenerator {
         painter: DvdPayloadPainter,
         sink: SequentialSink,
         emit: (String, String, Double) -> Void,
-        totalBytes: Int64
+        totalBytes: Int64,
+        timestamp: Date
     ) throws -> GenerationResult {
         let sectors = request.geometry.sectors
         var plan: Iso9660LayoutPlan?
@@ -89,7 +94,8 @@ public struct DvdImageGenerator: DiscImageGenerator {
         if let candidate = try? Iso9660Writer.plan(
             entries: [],
             volumeSectors: sectors,
-            volumeLabel: request.volumeLabel
+            volumeLabel: request.volumeLabel,
+            timestamp: timestamp
         ) {
             let start = Self.alignToBlock(candidate.metadataEndLbaExclusive)
             if sectors - start >= DvdConstants.sectorsPerBlock {
@@ -134,7 +140,8 @@ public struct DvdImageGenerator: DiscImageGenerator {
         painter: DvdPayloadPainter,
         sink: SequentialSink,
         emit: (String, String, Double) -> Void,
-        totalBytes: Int64
+        totalBytes: Int64,
+        timestamp: Date
     ) throws -> GenerationResult {
         let sectors = request.geometry.sectors
         let entries = try FileTree.scan(root: dataDirectory)
@@ -142,7 +149,8 @@ public struct DvdImageGenerator: DiscImageGenerator {
             entries: entries,
             volumeSectors: sectors,
             volumeLabel: request.volumeLabel,
-            filesAtOuterRing: request.dataAtOuterRing
+            filesAtOuterRing: request.dataAtOuterRing,
+            timestamp: timestamp
         )
         let range = try drawingRange(plan: plan, sectors: sectors)
 
@@ -213,9 +221,14 @@ public struct DvdImageGenerator: DiscImageGenerator {
 
     /// 逐块绘制并按 LBA 顺序写入 `SequentialSink`。
     ///
-    /// 每个 ECC Block 都是一次「先采样、再顺序写」，中途检查取消令牌并回调进度。
-    /// 备注（第二轮优化方向）：源项目用「并行生成 + 按序写出」提速；本次实现
-    /// 先保证链路正确，单线程顺序写，避免在共享构建机上与其他进程抢核心。
+    /// 每个 ECC Block 的内容只依赖自己的 LBA（没有跨块携带的编码状态），所以用
+    /// `ParallelPipeline` 按组并行采样，再按 0,1,2… 的顺序单线程写 sink——
+    /// 与串行版本逐字节一致（`DISCI_MAX_WORKERS=1` 时退化为串行，用于对拍）。
+    ///
+    /// - 每次 produce 画 `payloadBlocksPerGroup` 个 Block（128 KiB），减少调度次数；
+    /// - 并发由 `chunkSize` 决定（`concurrentPerform` 会跑满 iterations），
+    ///   本机 Apple M5 是 4P+6E，默认取 `min(核数, 8)`；
+    /// - 缓冲从池里复用，整盘 14 万个 Block 不再每次都 malloc 32 KiB。
     private func paintBlocks(
         startLba: Int,
         endLba: Int,
@@ -228,20 +241,113 @@ public struct DvdImageGenerator: DiscImageGenerator {
     ) throws {
         let totalBlocks = (endLba - startLba) / DvdConstants.sectorsPerBlock
         guard totalBlocks > 0 else { return }
-        var payloads = [UInt8](repeating: 0, count: DvdConstants.payloadBytesPerBlock)
-        for blockIndex in 0..<totalBlocks {
-            try request.cancellation.check()
-            let lba = startLba + blockIndex * DvdConstants.sectorsPerBlock
-            painter.paintBlock(firstLba: lba, payloads: &payloads)
-            try sink.write(payloads)
-            let fraction = baseFraction + fractionSpan * Double(blockIndex + 1) / Double(totalBlocks)
-            emit("mapping", "绘制 ECC Block \(blockIndex + 1)/\(totalBlocks)（LBA \(lba)）", fraction)
+
+        let requestedWorkers = max(1, ParallelPipeline.defaultWorkers)
+        let isSerial = requestedWorkers == 1
+        // 一次 produce 画几个 Block（单块 32 KiB）。
+        let blocksPerGroup = isSerial ? 1 : 4
+        let groupBytes = blocksPerGroup * DvdConstants.payloadBytesPerBlock
+        let groupCount = (totalBlocks + blocksPerGroup - 1) / blocksPerGroup
+        // 一次并行处理多少个 produce 组（决定内存上界）。
+        let chunkSize = isSerial ? 1 : max(4, min(requestedWorkers, 8))
+        // `ParallelPipeline.workers` 是真正的并发度：把这一组切成 workers 个区间。
+        let pipelineWorkers = isSerial ? 1 : chunkSize
+
+        var completedBlocks = 0
+        let pool = DvdPayloadBufferPool(count: chunkSize, capacity: groupBytes)
+        try ParallelPipeline.run(
+            count: groupCount,
+            chunkSize: chunkSize,
+            workers: pipelineWorkers,
+            cancellation: request.cancellation,
+            produce: { groupIndex -> DvdPayloadGroup in
+                let firstBlock = groupIndex * blocksPerGroup
+                let blocks = min(blocksPerGroup, totalBlocks - firstBlock)
+                var buffer = pool.acquire()
+                let baseLba = startLba + firstBlock * DvdConstants.sectorsPerBlock
+                buffer.withUnsafeMutableBufferPointer { output in
+                    for offset in 0..<blocks {
+                        let sliceStart = offset * DvdConstants.payloadBytesPerBlock
+                        let sliceEnd = sliceStart + DvdConstants.payloadBytesPerBlock
+                        let slice = UnsafeMutableBufferPointer(rebasing: output[sliceStart..<sliceEnd])
+                        painter.paintBlock(
+                            firstLba: baseLba + offset * DvdConstants.sectorsPerBlock,
+                            payloads: slice
+                        )
+                    }
+                }
+                return DvdPayloadGroup(bytes: buffer, blockCount: blocks)
+            },
+            consume: { groups in
+                for group in groups {
+                    let byteCount = group.blockCount * DvdConstants.payloadBytesPerBlock
+                    try group.bytes.withUnsafeBytes { raw in
+                        try sink.write(UnsafeRawBufferPointer(rebasing: raw[0..<byteCount]))
+                    }
+                    pool.release(group.bytes)
+                    let firstLba = startLba + completedBlocks * DvdConstants.sectorsPerBlock
+                    completedBlocks += group.blockCount
+                    let fraction = baseFraction + fractionSpan * Double(completedBlocks) / Double(totalBlocks)
+                    emit(
+                        "mapping",
+                        "绘制 ECC Block \(completedBlocks)/\(totalBlocks)（LBA \(firstLba)）",
+                        fraction
+                    )
+                }
+            }
+        )
+    }
+
+    /// ISO 日期字段的时间源。
+    ///
+    /// 默认取当前时间（用户生成时是自然的）。设置 `SOURCE_DATE_EPOCH`（Unix 秒，
+    /// 允许小数）后固定成那个瞬间 —— 这是可复现构建的通用约定，也让「串行 vs 并行」
+    /// 的输出可以逐字节比对（否则 PVD/目录记录里的日期每次都不同）。
+    static func generationTimestamp(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Date {
+        if let raw = environment["SOURCE_DATE_EPOCH"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let seconds = Double(raw), seconds.isFinite {
+            return Date(timeIntervalSince1970: seconds)
         }
+        return Date()
     }
 
     private static func alignToBlock(_ lba: Int) -> Int {
         let block = DvdConstants.sectorsPerBlock
         let remainder = lba % block
         return remainder == 0 ? lba : lba + (block - remainder)
+    }
+}
+
+/// 一次 produce 产出的若干连续 ECC Block（按 LBA 顺序）。
+private struct DvdPayloadGroup {
+    var bytes: [UInt8]
+    var blockCount: Int
+}
+
+/// payload 缓冲的复用池（并行 produce / 串行 consume 各取各还）。
+private final class DvdPayloadBufferPool: @unchecked Sendable {
+    private let capacity: Int
+    private var buffers: [[UInt8]]
+    private let lock = NSLock()
+
+    init(count: Int, capacity: Int) {
+        self.capacity = capacity
+        buffers = (0..<max(1, count)).map { _ in [UInt8](repeating: 0, count: capacity) }
+        buffers.reserveCapacity(max(1, count))
+    }
+
+    func acquire() -> [UInt8] {
+        lock.lock()
+        let buffer = buffers.popLast()
+        lock.unlock()
+        return buffer ?? [UInt8](repeating: 0, count: capacity)
+    }
+
+    func release(_ buffer: [UInt8]) {
+        lock.lock()
+        buffers.append(buffer)
+        lock.unlock()
     }
 }

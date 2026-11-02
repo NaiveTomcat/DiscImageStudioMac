@@ -12,14 +12,17 @@ import Foundation
 /// 这里只做「选 Q 并扰码」；ECC / EFMPlus / NRZI 由 `DvdChannelEncoder` 负责，
 /// 因为光盘刻录时 ECC 是刻录机固件按 payload 重建的（与源项目一致）。
 ///
-/// 性能：每个 ECC Block 只在第一个 payload 码字上做一次精确的
-/// 弧长 →（半径，角度）求解，之后按已知的通道位偏移做局部线性推进
-/// （`DvdSpiral.advance`），并用二阶旋转递推 sin/cos；每个 Block 都会精确重开，
-/// 误差不会跨 Block 累积。
+/// 性能要点（输出与优化前逐字节一致）：
+/// - 每个 ECC Block 只在第一个 payload 码字上做一次精确的弧长 →（半径，角度）求解，
+///   之后按已知的通道位偏移做局部线性推进（`DvdSpiral.advance`）+ 二阶旋转递推；
+///   每个 Block 精确重开，误差不跨块累积；
+/// - 整个 Block 在 `payloads` / 通道位偏移表 / 图片像素的 `UnsafeBufferPointer`
+///   里跑完（省掉每字节的数组边界检查与跨模块属性访问）；
+/// - 影调判定走 `DvdToneDecider`（预计算 256 项灰度表 + 内联抖动哈希）。
 struct DvdPayloadPainter: Sendable {
     let spiral: DvdSpiral
     let sampler: DvdDiscSampler
-    let tone: ToneProfile
+    let decider: DvdToneDecider
     /// DVD 的螺旋方向是顺时针（源项目约定）。
     let clockwise: Bool
     let startAngleRadians: Double
@@ -55,7 +58,7 @@ struct DvdPayloadPainter: Sendable {
     ) {
         self.spiral = spiral
         sampler = DvdDiscSampler(image: image, outerRadiusMm: spiral.outerRadiusMm)
-        self.tone = tone
+        decider = DvdToneDecider(tone: tone)
         self.clockwise = clockwise
         self.startAngleRadians = startAngleRadians
     }
@@ -66,62 +69,73 @@ struct DvdPayloadPainter: Sendable {
     /// - 图片外（alpha = 0）的字节保持 0，属于「不受控区」，刻录后是扰码噪声。
     func paintBlock(firstLba: Int, payloads: inout [UInt8]) {
         precondition(payloads.count == DvdConstants.payloadBytesPerBlock)
-        precondition(firstLba >= 0 && firstLba % DvdConstants.sectorsPerBlock == 0)
-        for index in payloads.indices {
-            payloads[index] = 0
+        payloads.withUnsafeMutableBufferPointer { output in
+            paintBlock(firstLba: firstLba, payloads: output)
         }
+    }
+
+    /// `paintBlock` 的缓冲指针版本（并行管线一次画多个 Block 时用，避免复制）。
+    func paintBlock(firstLba: Int, payloads output: UnsafeMutableBufferPointer<UInt8>) {
+        precondition(output.count == DvdConstants.payloadBytesPerBlock)
+        precondition(firstLba >= 0 && firstLba % DvdConstants.sectorsPerBlock == 0)
+        output.update(repeating: 0)
 
         let blockFirstGlobalBit = Double(firstLba) * Double(DvdConstants.channelBitsPerSector)
         let direction = clockwise ? -1.0 : 1.0
         let bitLength = spiral.channelBitLengthMm
         let offsets = Self.channelOffsets
 
-        var radiusMm = 0.0
-        var cosTheta = 1.0
-        var sinTheta = 0.0
-        var previousGlobalBit = 0.0
+        offsets.withUnsafeBufferPointer { channelOffsets in
+            sampler.withUnsafePixels { pixels in
+                var radiusMm = 0.0
+                var cosTheta = 1.0
+                var sinTheta = 0.0
+                var previousGlobalBit = 0.0
 
-        for sector in 0..<DvdConstants.sectorsPerBlock {
-            let psn = UInt32(firstLba + sector) &+ DvdConstants.physicalSectorNumberOffset
-            let mask = DvdDataFrameBuilder.payloadScramblerMask(physicalSectorNumber: psn)
-            let toneBase = Int64(firstLba + sector) * Int64(DvdConstants.payloadBytesPerSector)
-            let payloadBase = sector * DvdConstants.payloadBytesPerSector
-            for byteIndex in 0..<DvdConstants.payloadBytesPerSector {
-                let payloadIndex = payloadBase + byteIndex
-                let globalBit = blockFirstGlobalBit + Double(offsets[payloadIndex])
-                if payloadIndex == 0 {
-                    // 每个 Block 精确重开，清掉上一批的递推误差。
-                    let point = spiral.atArcLength(globalBit * bitLength)
-                    radiusMm = point.radiusMm
-                    let angle = startAngleRadians + direction * point.angleRadians
-                    cosTheta = cos(angle)
-                    sinTheta = sin(angle)
-                } else {
-                    let deltaArc = (globalBit - previousGlobalBit) * bitLength
-                    let step = spiral.advance(radiusMm: radiusMm, deltaArcLengthMm: deltaArc)
-                    radiusMm = step.radiusMm
-                    let deltaAngle = direction * step.deltaAngleRadians
-                    let halfSquare = 0.5 * deltaAngle * deltaAngle
-                    let nextCos = cosTheta * (1 - halfSquare) - sinTheta * deltaAngle
-                    let nextSin = sinTheta * (1 - halfSquare) + cosTheta * deltaAngle
-                    cosTheta = nextCos
-                    sinTheta = nextSin
+                for sector in 0..<DvdConstants.sectorsPerBlock {
+                    let psn = UInt32(firstLba + sector) &+ DvdConstants.physicalSectorNumberOffset
+                    let mask = DvdDataFrameBuilder.payloadScramblerMask(physicalSectorNumber: psn)
+                    let toneBase = Int64(firstLba + sector) * Int64(DvdConstants.payloadBytesPerSector)
+                    let payloadBase = sector * DvdConstants.payloadBytesPerSector
+                    for byteIndex in 0..<DvdConstants.payloadBytesPerSector {
+                        let payloadIndex = payloadBase + byteIndex
+                        let globalBit = blockFirstGlobalBit + Double(channelOffsets[payloadIndex])
+                        if payloadIndex == 0 {
+                            // 每个 Block 精确重开，清掉上一批的递推误差。
+                            let point = spiral.atArcLength(globalBit * bitLength)
+                            radiusMm = point.radiusMm
+                            let angle = startAngleRadians + direction * point.angleRadians
+                            cosTheta = cos(angle)
+                            sinTheta = sin(angle)
+                        } else {
+                            let deltaArc = (globalBit - previousGlobalBit) * bitLength
+                            let step = spiral.advance(radiusMm: radiusMm, deltaArcLengthMm: deltaArc)
+                            radiusMm = step.radiusMm
+                            let deltaAngle = direction * step.deltaAngleRadians
+                            let halfSquare = 0.5 * deltaAngle * deltaAngle
+                            let nextCos = cosTheta * (1 - halfSquare) - sinTheta * deltaAngle
+                            let nextSin = sinTheta * (1 - halfSquare) + cosTheta * deltaAngle
+                            cosTheta = nextCos
+                            sinTheta = nextSin
+                        }
+                        previousGlobalBit = globalBit
+
+                        let sample = sampler.sample(
+                            xMm: radiusMm * cosTheta,
+                            yMm: radiusMm * sinTheta,
+                            pixels: pixels
+                        )
+                        guard sample.alpha > 0 else { continue }
+                        let white = decider.useWhite(
+                            sample.luminance,
+                            sampleIndex: toneBase + Int64(byteIndex)
+                        )
+                        let scrambled: UInt8 = white
+                            ? DvdConstants.whiteScrambledByte
+                            : DvdConstants.blackScrambledByte
+                        output[payloadIndex] = scrambled ^ mask[byteIndex]
+                    }
                 }
-                previousGlobalBit = globalBit
-
-                let sample = sampler.sample(
-                    xMm: radiusMm * cosTheta,
-                    yMm: radiusMm * sinTheta
-                )
-                guard sample.alpha > 0 else { continue }
-                let white = tone.useWhite(
-                    sample.luminance,
-                    sampleIndex: toneBase + Int64(byteIndex)
-                )
-                let scrambled: UInt8 = white
-                    ? DvdConstants.whiteScrambledByte
-                    : DvdConstants.blackScrambledByte
-                payloads[payloadIndex] = scrambled ^ mask[byteIndex]
             }
         }
     }
