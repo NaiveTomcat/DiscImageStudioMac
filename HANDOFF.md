@@ -499,8 +499,10 @@ UI 验收额外项：离屏渲染主页 + 设计页 PNG 成功。
 | D GUI | 六页面（主页/设计/预览/导出/刻录/标定）+ `.discproj` v2 + ImageRenderer 离屏回归 | 80 用例 |
 | E 刻录 | `BurnService`/`DrutilBurner`/`MockBurnService` + 命令构造/解析纯函数 + 文档 + CI | 60 用例 |
 | CLI（lead） | `discimage-cli generate/presets/geometry/info`，三引擎已接线 | 端到端脚本 |
+| 标定闭环（追加） | 图案生成 + 照片单应矫正 + 单曲线反推（内外半径/转角/三次轨距）+ `.calibration.json` | 39 用例 |
+| GUI 标定页（追加） | 生成图案 → 导照片 → 拖边界 → 点曲线 → 反推 → 应用回工程 | 12 用例 |
 
-合计约 1.57 万行 Swift 源码 + 0.66 万行测试。
+合计约 1.9 万行 Swift 源码 + 0.8 万行测试（含 0.1.1 的标定闭环），共 411 个测试。
 
 ### 11.2 与 HANDOFF §4.3 的两处必要偏差（SwiftPM 硬约束，已在 `Package.swift` 与 `docs/ARCHITECTURE.md` 注明）
 
