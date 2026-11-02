@@ -48,6 +48,7 @@ let package = Package(
         .testTarget(name: "DiscImageCdTests", dependencies: ["DiscImageCd", "DiscImageCore"]),
         .testTarget(name: "DiscImageBluRayTests", dependencies: ["DiscImageBluRay", "DiscImageCore"]),
         .testTarget(name: "DiscImageUITests", dependencies: ["DiscImageUI", "DiscImageCore"]),
+        .testTarget(name: "DiscImageBurningTests", dependencies: ["DiscImageBurning", "DiscImageCore"]),
     ],
     swiftLanguageModes: [.v5]
 )
