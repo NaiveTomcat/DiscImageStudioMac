@@ -7,8 +7,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 SCRATCH="${SCRATCH:-.build}"
+# 限速：默认只开 2 个编译任务，避免把开发机 CPU 打满（并行 agent 时尤其重要）。
+JOBS="${JOBS:-2}"
 export CLANG_MODULE_CACHE_PATH="$PWD/$SCRATCH/modulecache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$PWD/$SCRATCH/modulecache"
 mkdir -p "$CLANG_MODULE_CACHE_PATH"
-echo "+ swift build --disable-sandbox --scratch-path $SCRATCH $*" >&2
-exec swift build --disable-sandbox --scratch-path "$SCRATCH" "$@"
+echo "+ swift build --jobs $JOBS --disable-sandbox --scratch-path $SCRATCH $*" >&2
+exec swift build --jobs "$JOBS" --disable-sandbox --scratch-path "$SCRATCH" "$@"

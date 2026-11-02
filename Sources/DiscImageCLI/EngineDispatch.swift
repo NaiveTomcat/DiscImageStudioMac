@@ -1,11 +1,17 @@
+import DiscImageBluRay
+import DiscImageCd
 import DiscImageCore
+import DiscImageDvd
 import Foundation
 
-/// 引擎分发。
+/// 引擎分发：把 `DiscFamily` 映射到对应介质 target 的公开入口。
 ///
-/// 每个介质 target 导出 `<Family>ImageGenerator: DiscImageGenerator`。
-/// 三个工作包落地前，这里保持最小实现：未知介质一律明确报错，
-/// 而不是静默生成空文件。
+/// 三个 target 各自导出一个 `DiscImageGenerator` 实现，这里只做一一对应，
+/// 不含任何编码逻辑——保证 CLI 与 UI 走同一条链路。
 func generator(for family: DiscFamily) throws -> DiscImageGenerator {
-    throw DiscError.unsupported("\(family.displayNameZH) 引擎尚未接入（工作包 A/B/C 落地后由 lead 接线）")
+    switch family {
+    case .cd: return CdImageGenerator()
+    case .dvd: return DvdImageGenerator()
+    case .bluRay: return BluRayImageGenerator()
+    }
 }

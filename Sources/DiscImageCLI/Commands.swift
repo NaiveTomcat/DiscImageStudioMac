@@ -22,19 +22,22 @@ func runGenerate(_ arguments: [String]) throws {
     let tone = makeTone(parser: parser, family: family)
     try tone.validate()
 
+    let image = try loadImage(parser: parser)
+    let dataDirectory = parser.string("data-dir").map {
+        URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath)
+    }
+
+    // 默认格式：CD 默认音频（WAV），给了 --data-dir 才走数据盘 ISO；DVD/BD 只有 ISO。
     let format: GenerationOutputFormat
     if let raw = parser.string("format") {
         guard let parsed = GenerationOutputFormat(rawValue: raw), GenerationOutputFormat.options(for: family).contains(parsed) else {
             throw DiscError.unsupported("\(family.displayNameZH) 不支持输出格式：\(raw)")
         }
         format = parsed
+    } else if family == .cd {
+        format = dataDirectory == nil ? .wav : .iso
     } else {
-        format = family == .cd ? .iso : .iso
-    }
-
-    let image = try loadImage(parser: parser)
-    let dataDirectory = parser.string("data-dir").map {
-        URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath)
+        format = .iso
     }
     if format == .iso, family == .cd, dataDirectory == nil {
         // CD 的 ISO 输出只在数据盘模式有意义
@@ -152,15 +155,28 @@ func runPresets(_ arguments: [String]) {
         print("== \(family.displayNameZH) ==")
         for preset in DiscPreset.presets(for: family) {
             let pitch = String(format: "%.4f µm", preset.pitchMicrometres)
-            print(String(format: "  %-32@ %12ld 扇区  %.3f–%.3f mm  螺距 %@%@",
-                         preset.id as NSString,
-                         preset.sectors,
-                         preset.innerRadiusMm,
-                         preset.outerRadiusMm,
-                         pitch as NSString,
-                         preset.isMeasured ? "  [实测]" : ""))
+            let sectors = String(format: "%9d", preset.sectors)
+            let radii = String(format: "%7.3f–%-7.3f mm", preset.innerRadiusMm, preset.outerRadiusMm)
+            let mark = preset.isMeasured ? "  [实测]" : ""
+            print("  \(pad(preset.id, to: 30)) \(sectors) 扇区  \(radii)  螺距 \(pitch)\(mark)")
         }
     }
+}
+
+/// 按「显示宽度」补空格：中文/全角字符按 2 列算，否则终端里对不齐。
+func pad(_ text: String, to width: Int) -> String {
+    var visible = 0
+    for scalar in text.unicodeScalars {
+        visible += scalar.value >= 0x1100 && (scalar.value <= 0x115F
+            || (0x2E80...0xA4CF).contains(scalar.value)
+            || (0xAC00...0xD7A3).contains(scalar.value)
+            || (0xF900...0xFAFF).contains(scalar.value)
+            || (0xFE30...0xFE4F).contains(scalar.value)
+            || (0xFF00...0xFF60).contains(scalar.value)
+            || (0xFFE0...0xFFE6).contains(scalar.value)) ? 2 : 1
+    }
+    guard visible < width else { return text }
+    return text + String(repeating: " ", count: width - visible)
 }
 
 func runGeometry(_ arguments: [String]) throws {

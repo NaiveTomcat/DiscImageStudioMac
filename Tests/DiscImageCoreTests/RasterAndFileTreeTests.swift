@@ -40,7 +40,11 @@ final class RasterImageTests: XCTestCase {
     }
 
     func testOpaqueBinaryGrayscaleDetection() {
-        XCTAssertTrue(RasterImage.gray(width: 2, height: 2, value: 0).isOpaqueBinaryGrayscale == false)
+        // 纯黑/纯白都算「已是二值图」——采样时要用最近邻，不能把抖动密度插值成中灰
+        XCTAssertTrue(RasterImage.gray(width: 2, height: 2, value: 0).isOpaqueBinaryGrayscale)
+        XCTAssertTrue(RasterImage.gray(width: 2, height: 2, value: 255).isOpaqueBinaryGrayscale)
+        // 中灰不是二值图
+        XCTAssertFalse(RasterImage.gray(width: 2, height: 2, value: 128).isOpaqueBinaryGrayscale)
         var pixels: [UInt8] = []
         for value: UInt8 in [0, 255, 255, 0] {
             pixels += [value, value, value, 255]
