@@ -129,28 +129,30 @@ public struct BluRayImageGenerator: DiscImageGenerator {
 
         // MARK: 绘图区
 
+        // 每簇是一个完全独立的 64 KiB 输出块：位置只依赖簇号，扰码掩码只依赖簇首 PSN，
+        // 没有跨簇携带的编码状态。因此可以放心按簇并行，再由 `ParallelPipeline`
+        // 按 0,1,2… 的顺序交给单线程写出 —— 与串行版本逐字节一致。
         let clusterCount = Int((drawingEnd - drawingStart) / UInt32(BluRaySpec.sectorsPerCluster))
-        let drawingBytes = Int64(drawingEnd - drawingStart) * Int64(BluRaySpec.bytesPerSector)
-        var payload = [UInt8](repeating: 0, count: BluRaySpec.payloadBytesPerCluster)
-        var sectorBytes = [UInt8](repeating: 0, count: BluRaySpec.bytesPerSector)
-        var sector = drawingStart
-        for cluster in 0..<Int(clusterCount) {
-            try request.cancellation.check()
-            try mapping.fillPayload(firstSector: sector, into: &payload)
-            let psn = BluRaySpec.firstLayer0PhysicalSector &+ sector
-            let mask = BluRayScrambler.mask(physicalSectorNumber: psn, length: BluRaySpec.bytesPerSector)
-            for sub in 0..<BluRaySpec.sectorsPerCluster {
-                let base = sub * BluRaySpec.bytesPerSector
-                for index in 0..<BluRaySpec.bytesPerSector {
-                    sectorBytes[index] = payload[base + index] ^ mask[index]
+        let drawingStartSector = drawingStart
+        var completedClusters = 0
+        try ParallelPipeline.run(
+            count: clusterCount,
+            chunkSize: 64,
+            workers: ParallelPipeline.defaultWorkers,
+            cancellation: request.cancellation,
+            produce: { index -> [UInt8] in
+                let sector = drawingStartSector + UInt32(index * BluRaySpec.sectorsPerCluster)
+                return try mapping.scrambledCluster(firstSector: sector)
+            },
+            consume: { clusters in
+                for clusterBytes in clusters {
+                    try sink.write(clusterBytes)
+                    completedClusters += 1
+                    let fraction = 0.05 + 0.85 * (Double(completedClusters) / Double(max(clusterCount, 1)))
+                    emit("mapping", "盘面图案 \(completedClusters)/\(clusterCount) 簇", fraction)
                 }
-                try sink.write(sectorBytes)
             }
-            sector += UInt32(BluRaySpec.sectorsPerCluster)
-            let fraction = 0.05 + 0.85 * (Double(cluster + 1) / Double(max(clusterCount, 1)))
-            emit("mapping", "盘面图案 \(cluster + 1)/\(clusterCount) 簇", fraction)
-        }
-        _ = drawingBytes
+        )
 
         // MARK: 后缀
 
