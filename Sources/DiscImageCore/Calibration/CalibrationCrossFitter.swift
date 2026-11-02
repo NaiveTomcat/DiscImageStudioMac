@@ -7,6 +7,11 @@ import Foundation
 /// - 搜索框默认 ±0.02 mm，最优解贴边界时自动扩大到 ±0.1 / ±0.5 mm；
 /// - 输出 rms / max / 离群点；平均 > 0.35 mm 或最大 > 0.8 mm 的候选不可应用；
 /// - 点数不足（半径拟合 6 点；三次轨距 12 个不同半径且覆盖 60%）时只拟合半径并提示。
+/// 让长耗时搜索可以被 UI 取消：检查点都放在「一颗种子/一次扩大范围」的边界上。
+private func throwIfCancelled(_ flag: CancellationFlag?) throws {
+    if let flag, flag.isCancelled { throw CancellationError() }
+}
+
 public enum CalibrationCrossFitter {
     private static let nearHalfTurnWarning =
         "有相邻曲线点的转角接近半圈，绕圈判断可能不可靠；请补点后复核。"
@@ -24,9 +29,11 @@ public enum CalibrationCrossFitter {
     public static func fit(
         session: CalibrationSession,
         points: [CalibrationPoint],
-        options: CalibrationFitOptions? = nil
+        options: CalibrationFitOptions? = nil,
+        cancellation: CancellationFlag? = nil
     ) throws -> CalibrationFitResult {
         try session.validate()
+        try throwIfCancelled(cancellation)
         let fitOptions = options ?? session.fitOptions ?? .default
         try fitOptions.validate()
         try validate(points: points, session: session)
@@ -83,9 +90,10 @@ public enum CalibrationCrossFitter {
             options: fitOptions,
             generated: generatedGeometry,
             radiusMarginMm: margin,
-            inputWarnings: inputWarnings
+            inputWarnings: inputWarnings,
+            cancellation: cancellation
         )
-        return context.run()
+        return try context.run()
     }
 
     /// 只做点数/坐标合法性检查（会话保存前也可以调用）。
@@ -258,6 +266,7 @@ public enum CalibrationCrossFitter {
         let generated: CalibrationTrackGeometry
         let radiusMarginMm: Double
         let inputWarnings: [String]
+        let cancellation: CancellationFlag?
         let traces: Int
 
         private var geometryCache: [[Double]: CalibrationTrackGeometry?] = [:]
@@ -271,7 +280,8 @@ public enum CalibrationCrossFitter {
             options: CalibrationFitOptions,
             generated: CalibrationTrackGeometry,
             radiusMarginMm: Double,
-            inputWarnings: [String]
+            inputWarnings: [String],
+            cancellation: CancellationFlag?
         ) {
             self.target = target
             self.center = center
@@ -282,12 +292,13 @@ public enum CalibrationCrossFitter {
             self.generated = generated
             self.radiusMarginMm = radiusMarginMm
             self.inputWarnings = inputWarnings
+            self.cancellation = cancellation
             self.traces = (data.map(\.trace).max() ?? 0) + 1
         }
 
         // MARK: 自动范围
 
-        func run() -> CalibrationFitResult {
+        func run() throws -> CalibrationFitResult {
             var usedRange = options.searchRangeMm
             var outcome = solve(range: usedRange, delta: options.huberDeltaMm)
             var warnings = outcome.result.warnings
@@ -295,6 +306,7 @@ public enum CalibrationCrossFitter {
             if options.autoRange {
                 while usedRange < (CalibrationFitOptions.autoRangeSteps.last ?? 0.5) - 1e-9,
                       !outcome.result.succeeded || outcome.boundaryLimited {
+                    try throwIfCancelled(cancellation)
                     guard let next = CalibrationFitOptions.autoRangeSteps.first(where: { $0 > usedRange + 1e-9 }) else {
                         break
                     }
@@ -472,6 +484,7 @@ public enum CalibrationCrossFitter {
 
             var solutions: [Solution] = []
             for seed in shapeSeeds + ranked {
+                if let cancellation, cancellation.isCancelled { break }
                 let result = refine(seed)
                 if let duplicate = solutions.firstIndex(where: {
                     abs($0.inner - result.inner) < 1e-6 && abs($0.outer - result.outer) < 1e-6
