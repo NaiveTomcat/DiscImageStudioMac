@@ -167,6 +167,18 @@ afinfo artifacts/cover.wav                    # 期望：44.1 kHz / 16 bit / 2 c
 
 ---
 
+### 4.1 标定闭环
+
+- **已用合成数据验证**（`Tests/DiscImageCoreTests/Calibration*`，39 个用例）：
+  - 无噪声闭环：DVD 恒定轨距下半径恢复到 ~1e-14 mm、rms ~7e-10；
+  - 三次轨距闭环：c1/c2/c3 恢复到 ~1e-8；
+  - 透视 + 噪声（轮廓 0.3 px、曲线 0.2 px）：单应残差 ~0.18 px，半径误差 < 2e-5 mm、
+    系数相对误差 5–15%，判定为可应用；
+  - 圈偏移、相邻点接近半圈、点不足/覆盖不足、搜索框边界、会话 JSON 往返都有对应用例。
+- **无法验证**：真实照片的镜头径向畸变、遮挡与误选边界（合成只覆盖单应透视）；
+  盘面图案的实际可见度与描点精度；单条曲线对 c1/c2/c3 的唯一性；8 cm 盘实拍；
+  BD 真实盘的内外半径/总扇数/极性写回。这些都要等刻录机与空白盘。
+
 ## 5. 验证记录（本移植首版）
 
 - 编码层：`DiscImageCoreTests` / `DiscImageDvdTests` / `DiscImageCdTests` / `DiscImageBluRayTests` 为纯 Swift 单元测试，跑在 `swift test` 里；不依赖光驱、不依赖网络。
