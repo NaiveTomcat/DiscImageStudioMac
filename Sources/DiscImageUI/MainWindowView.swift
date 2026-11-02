@@ -193,6 +193,9 @@ public struct MainWindowView: View {
                 if model.isDirty {
                     BadgeView("未保存", colour: UITheme.warning)
                 }
+                if model.calibrationParametersUpdated {
+                    BadgeView("参数已更新", colour: UITheme.success)
+                }
             }
             if let url = model.projectURL {
                 Text(url.deletingLastPathComponent().path)

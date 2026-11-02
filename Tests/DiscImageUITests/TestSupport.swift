@@ -78,6 +78,73 @@ enum UITestSupport {
         return RasterImage(width: width, height: height, pixels: pixels)
     }
 
+    /// 合成一张「盘片照片」：实体外缘/中心孔/盘体/背景有明显灰度差，供标定测试用。
+    ///
+    /// 只有形状与灰度，不模拟透视——矫正算法只吃控制点，图片只负责让界面有东西可看。
+    static func syntheticDiscPhoto(size: Int = 512) -> RasterImage {
+        var pixels = [UInt8](repeating: 0, count: size * size * 4)
+        let centre = Double(size) / 2
+        let outerRadius = Double(size) * 0.43
+        let holeRadius = outerRadius * 0.125
+        for y in 0..<size {
+            for x in 0..<size {
+                let dx = Double(x) + 0.5 - centre
+                let dy = Double(y) + 0.5 - centre
+                let radius = (dx * dx + dy * dy).squareRoot()
+                let value: UInt8
+                if radius > outerRadius * 1.02 {
+                    value = 20                                   // 桌面背景
+                } else if radius > outerRadius * 0.985 {
+                    value = 235                                  // 实体外缘亮边
+                } else if radius < holeRadius * 0.94 {
+                    value = 12                                   // 中心孔（透黑）
+                } else if radius < holeRadius * 1.04 {
+                    value = 210                                  // 中心孔亮边
+                } else {
+                    // 盘体：随半径轻微变化的灰阶 + 几条同心亮环，方便看清矫正效果。
+                    let tone = 105 + 30 * (radius / outerRadius)
+                    let ring = Int(radius / (outerRadius / 18)).isMultiple(of: 3) ? 18 : 0
+                    value = UInt8(min(255, Int(tone) + ring))
+                }
+                let offset = (y * size + x) * 4
+                pixels[offset] = value
+                pixels[offset + 1] = value
+                pixels[offset + 2] = value
+                pixels[offset + 3] = 255
+            }
+        }
+        return RasterImage(width: size, height: size, pixels: pixels)
+    }
+
+    /// 小几何（DVD 24–40 mm / 1024 扇区），让标定图案与反推测试跑得快。
+    static func calibrationGeometry(family: DiscFamily = .dvd) -> DiscGeometry {
+        switch family {
+        case .dvd:
+            return DiscGeometry(
+                family: .dvd,
+                innerRadiusMm: 24,
+                outerRadiusMm: 40,
+                sectors: 1024,
+                channelBitLengthNm: 133.3
+            )
+        case .cd:
+            return DiscGeometry(
+                family: .cd,
+                innerRadiusMm: 24.5,
+                outerRadiusMm: 56.8,
+                sectors: 1000,
+                linearVelocityMmPerSecond: 1200
+            )
+        case .bluRay:
+            return DiscGeometry(
+                family: .bluRay,
+                innerRadiusMm: 24,
+                outerRadiusMm: 40,
+                sectors: 1024
+            )
+        }
+    }
+
     static func sampleProject(family: DiscFamily = .cd) -> DiscProject {
         DiscProject.makeNew(
             name: "测试工程",

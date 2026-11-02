@@ -142,6 +142,57 @@ final class OffscreenRenderTests: XCTestCase {
         )
     }
 
+    /// 标定页：已导入照片（第一步，控制点可拖）。
+    func testRenderCalibrationPageWithPhoto() throws {
+        let model = try makeCalibrationModel(stage: .photo)
+        _ = try renderAndAssert(
+            CalibrationView(model: model, scrollable: false),
+            size: CGSize(width: 1240, height: 800),
+            name: "calibration-photo"
+        )
+    }
+
+    /// 标定页：矫正已确认、已描点（第二步，含预测/图例）。
+    func testRenderCalibrationPageWithTrace() throws {
+        let model = try makeCalibrationModel(stage: .trace)
+        _ = try renderAndAssert(
+            CalibrationView(model: model, scrollable: false),
+            size: CGSize(width: 1240, height: 800),
+            name: "calibration-trace"
+        )
+    }
+
+    private enum CalibrationStage {
+        case photo
+        case trace
+    }
+
+    private func makeCalibrationModel(stage: CalibrationStage) throws -> StudioModel {
+        var project = UITestSupport.sampleProject(family: .dvd)
+        project.name = "标定快照"
+        project.geometry = UITestSupport.calibrationGeometry()
+        let model = StudioModel(
+            project: project,
+            recentStore: RecentProjectStore(fileURL: scratch.appendingPathComponent("recent.json")),
+            burnService: MockBurnAdapter()
+        )
+        let generation = CalibrationGenerationSnapshot(
+            geometry: project.geometry,
+            tone: project.effectiveTone,
+            cdInterleave: false
+        )
+        try model.calibration.loadSession(CalibrationSession(generation: generation))
+        try model.calibration.importPhoto(UITestSupport.syntheticDiscPhoto(size: 256))
+        if stage == .trace {
+            try model.calibration.rectify()
+            model.calibration.confirmRectification()
+            for radius in stride(from: 27.0, through: 38.0, by: 1.5) {
+                model.calibration.addTracePoint(CalibrationPoint(xMm: radius, yMm: 0))
+            }
+        }
+        return model
+    }
+
     func testRenderMainWindowShell() throws {
         let model = try makeModel(withLayer: true)
         model.navigate(to: .design)

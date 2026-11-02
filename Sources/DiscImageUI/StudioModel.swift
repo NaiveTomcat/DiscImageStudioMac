@@ -85,9 +85,13 @@ public final class StudioModel: ObservableObject {
     @Published public private(set) var previewErrorMessage: String?
     /// 文件区（黄色标记）；数据盘目录为空时为 nil。
     @Published public private(set) var fileRegion: FileRegion?
+    /// 标定参数应用后亮起，直到新建/打开工程。界面用它显示「参数已更新」提示。
+    @Published public private(set) var calibrationParametersUpdated = false
 
     public let generationJob = GenerationJob()
     public let burnWorkflow: BurnWorkflow
+    /// 标定闭环的状态机（生成图案 → 照片矫正 → 曲线反推 → 应用）。
+    public let calibration: CalibrationModel
 
     private let projectStore: ProjectStore
     private let recentStore: RecentProjectStore
@@ -101,12 +105,14 @@ public final class StudioModel: ObservableObject {
         projectStore: ProjectStore = ProjectStore(),
         recentStore: RecentProjectStore = RecentProjectStore(),
         generationService: GenerationService = GenerationService(),
-        burnService: BurnServicing = BurnServiceProvider.makeDefault()
+        burnService: BurnServicing = BurnServiceProvider.makeDefault(),
+        calibration: CalibrationModel? = nil
     ) {
         self.projectStore = projectStore
         self.recentStore = recentStore
         self.generationService = generationService
         self.burnWorkflow = BurnWorkflow(service: burnService)
+        self.calibration = calibration ?? CalibrationModel()
         self.project = project ?? DiscProject.makeNew(name: "未命名工程", preset: .cd80)
         self.projectURL = projectURL
         self.recentProjects = recentStore.load()
@@ -190,6 +196,8 @@ public final class StudioModel: ObservableObject {
         selectedLayerID = nil
         layerImages = [:]
         layerLoadErrors = [:]
+        calibration.reset()
+        calibrationParametersUpdated = false
         page = .design
         refreshPreview()
         statusMessage = "已创建「\(projectName)」（\(preset.displayName)）"
@@ -204,6 +212,16 @@ public final class StudioModel: ObservableObject {
         reloadLayerImages()
         refreshPreview()
         recentProjects = recentStore.record(RecentProjectEntry(project: loaded, path: url))
+        calibrationParametersUpdated = false
+        calibration.reset()
+        if let sessionPath = loaded.calibrationSessionPath,
+           FileManager.default.fileExists(atPath: sessionPath) {
+            do {
+                try calibration.openSession(from: URL(fileURLWithPath: sessionPath))
+            } catch {
+                alertMessage = "工程关联的标定记录无法加载：\(Self.message(for: error))"
+            }
+        }
         page = .design
         statusMessage = "已打开「\(loaded.name)」"
     }
@@ -254,6 +272,8 @@ public final class StudioModel: ObservableObject {
         selectedLayerID = nil
         layerImages = [:]
         layerLoadErrors = [:]
+        calibration.reset()
+        calibrationParametersUpdated = false
         page = .home
         refreshPreview()
     }
@@ -336,7 +356,49 @@ public final class StudioModel: ObservableObject {
         refreshDiscPreview()
     }
 
-    /// 标定页「应用」：写入标定会话路径与三次轨距系数（蓝光是极性开关）。
+    /// 记录/清除工程关联的标定会话路径（生成图案、保存标定记录时调用）。
+    public func recordCalibrationSession(path: URL?) {
+        let trimmed = path?.path.trimmingCharacters(in: .whitespacesAndNewlines)
+        project.calibrationSessionPath = (trimmed?.isEmpty == false) ? trimmed : nil
+    }
+
+    /// 标定第二步「应用标定参数」：候选写回当前工程几何，并亮起「参数已更新」提示。
+    ///
+    /// 只更新内外半径与 DVD 三次轨距系数（`CalibrationFitCandidate.applying(to:)` 的语义）；
+    /// 扇区数、BD 极性等由生成快照决定，不在这一步改。
+    public func applyCalibrationCandidate(
+        _ candidate: CalibrationFitCandidate,
+        sessionPath: URL? = nil
+    ) throws {
+        guard candidate.isApplicable else {
+            throw DiscError.unsupported("候选偏差过大，不能应用；请修正标红点或补点后重新反推。")
+        }
+        try applyCalibrationGeometry(candidate.applying(to: project.geometry), sessionPath: sessionPath)
+    }
+
+    /// 把一组标定后的几何写回工程（内部校验 + 刷新预览 + 参数已更新提示）。
+    public func applyCalibrationGeometry(
+        _ geometry: DiscGeometry,
+        sessionPath: URL? = nil
+    ) throws {
+        guard geometry.family == project.discFamily else {
+            throw DiscError.invalidGeometry(
+                "标定几何的介质（\(geometry.family.displayNameZH)）与工程（\(project.discFamily.displayNameZH)）不一致。"
+            )
+        }
+        var updated = project
+        updated.geometry = geometry
+        if let sessionPath {
+            updated.calibrationSessionPath = sessionPath.path
+        }
+        try updated.validate()
+        project = updated
+        calibrationParametersUpdated = true
+        refreshPreview()
+        statusMessage = "标定参数已更新：内 \(String(format: "%.4f", geometry.innerRadiusMm)) mm / 外 \(String(format: "%.4f", geometry.outerRadiusMm)) mm"
+    }
+
+    /// 手工覆盖标定参数（旧版占位入口，保留给命令行/回归用例）。
     public func applyCalibration(
         sessionPath: String?,
         pitchLinear: Double,
@@ -356,6 +418,7 @@ public final class StudioModel: ObservableObject {
         }
         try updated.validate()
         project = updated
+        calibrationParametersUpdated = true
         refreshDiscPreview()
         statusMessage = "标定参数已写入工程"
     }
